@@ -1,0 +1,272 @@
+<div align="center">
+
+# 🌀 EverLoop
+
+**A production-grade autonomous agent framework with layered memory, MCP ecosystem, and zero-intrusion harness architecture.**
+
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![React](https://img.shields.io/badge/React-18-61DAFB?style=flat&logo=react&logoColor=black)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=flat&logo=typescript&logoColor=white)](https://typescriptlang.org)
+[![LangChain](https://img.shields.io/badge/LangChain-latest-1C3C3C?style=flat&logo=langchain&logoColor=white)](https://langchain.com)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat)](LICENSE)
+
+</div>
+
+---
+
+## What is EverLoop?
+
+EverLoop is not just another chatbot wrapper. It is an **engineering-first autonomous agent framework** built around a strict 7-step while-loop paradigm. Every conversation turn goes through context cleaning, LTM retrieval, LLM reasoning, tool execution, and memory persistence — all governed by a plugin system that attaches to the loop with **zero intrusion into core logic**.
+
+The name reflects the architecture: a loop that never breaks, never bloats, and never forgets what matters.
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        AgentLoop.arun()                      │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                    while True:                       │   │
+│  │                                                     │   │
+│  │  Step 0  [Harness] isolation_guard / context_opt.  │   │
+│  │  Step 1  ContextPipeline.prepare()                 │   │
+│  │           ├─ LTM RAG retrieval                     │   │
+│  │           ├─ SemanticNoiseFilter (Snip + Compact)  │   │
+│  │           ├─ WaterfallCompressor (4-stage)         │   │
+│  │           └─ StateOrganizer (anchor + inject)      │   │
+│  │  Step 2  Precondition check + plugin health gate   │   │
+│  │  Step 3  LLM inference (true streaming via astream)│   │
+│  │          [Harness] sandwich_reasoning on demand    │   │
+│  │  Step 4  Result check + [Harness] deterministic_   │   │
+│  │          linter hard validation                    │   │
+│  │  Step 5  Tool execution → STM write-back           │   │
+│  │          [Harness] wrap_child_agent summarization  │   │
+│  │  Step 6  Termination check                         │   │
+│  │  Step 7  Next iteration                            │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Post-loop: LTM session summarization & persistence        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Core Features
+
+### 🔗 Harness Plugin Framework
+A middleware architecture that attaches capabilities to the agent loop without modifying any core code. Plugins are registered in `middleware_plugin_hub`, health-checked on every iteration, and auto-disabled when fault rate exceeds threshold.
+
+| Plugin | Role |
+|--------|------|
+| `sandwich_reasoning` | Routes complex tasks through plan→execute→verify pipeline using different LLMs |
+| `deterministic_linter` | Hard-validates LLM output, auto-rejects and re-prompts on failure |
+| `isolation_guard` | Cuts parent context when spawning child agents, preventing cognitive contamination |
+| `context_optimizer` | Compresses mailbox history in long-running sub-agent calls |
+| `janitor_daemon` | Background async cleanup of expired sessions and orphaned tool results |
+
+### 🧠 Layered Memory System
+
+**Short-Term Memory (STM)**
+- Per-thread in-memory conversation store
+- Auto-summarizes when approaching context limits
+- Write-through to async DB queue (never blocks the loop)
+
+**Long-Term Memory (LTM)**
+- Extracts user facts and preferences from each session
+- Vector-store backed semantic retrieval (BGE / Milvus extensible)
+- Injected at Step 1 of every new conversation as grounding context
+
+### 📦 Context Pipeline — 4-Stage Waterfall Compressor
+
+The pipeline is the core defense against context bloat. Even if a tool writes 100k characters of logs, the next loop iteration cleans it down before it reaches the LLM.
+
+```
+Raw STM messages
+      │
+      ▼
+SemanticNoiseFilter
+  ├─ Snip: prune old verbose tool outputs
+  └─ Microcompact: fold repeated error patterns into one-liners
+      │
+      ▼
+WaterfallCompressor (4 levels, progressive)
+  └─ results written back to STM
+      │
+      ▼
+StateOrganizer
+  ├─ Head anchor: system prompt pinned first
+  └─ Tail injection: LTM snippets + env state appended last
+      │
+      ▼
+messages_for_llm → LLM
+```
+
+### 🔌 MCP Ecosystem
+
+Full [Model Context Protocol](https://modelcontextprotocol.io) support. External tool servers are registered through `ServerManager`, which handles lifecycle, permission isolation, endpoint validation, and health monitoring. Agents gain unlimited tool surface area without touching core code.
+
+### 🛠️ Skill System
+
+Skills are self-contained capability packages with their own virtual filesystem. An agent can browse skill files (`list_skill_files`), read them, and execute skill-specific tools — all within an isolated workspace. Ideal for packaging domain-specific workflows (code review, document generation, data analysis pipelines).
+
+### 🌊 True Streaming with Typed Packet Protocol
+
+Every SSE event carries a typed packet. The frontend routes each packet type to the correct renderer — no raw JSON leaks to the user.
+
+| Packet Type | Frontend Behavior |
+|-------------|-------------------|
+| `think` | Streams into collapsible thinking block with breathing indicator |
+| `think_end` | Auto-collapses thinking block, shows "已深度思考" |
+| `text` | Typewriter effect in main answer bubble |
+| `text_replace` | Atomically replaces streamed text (used after inline tool-call cleanup) |
+| `tool_call_start` | Shows tool card with breathing-light animation |
+| `tool_call_done` | Updates card to ✓ done, previews result |
+| `control` | Stream lifecycle (start / done / error) |
+
+---
+
+## Project Structure
+
+```
+EverLoop/
+├── main.py                      # Entry point (FastAPI on :8001)
+├── api/
+│   ├── router.py                # Route registration
+│   ├── chat_endpoint.py         # SSE streaming endpoint
+│   ├── auth_endpoint.py         # JWT auth
+│   ├── mcp_endpoint.py          # MCP server management API
+│   └── skill_endpoint.py        # Skill invocation API
+├── core/
+│   ├── agent_loop.py            # The 7-step while loop
+│   ├── context_pipeline.py      # Waterfall context compressor
+│   ├── streaming_handler.py     # SSE packet builder & dispatcher
+│   └── react_agent.py           # ReAct agent implementation
+├── memory/
+│   ├── short_term_memory.py     # Thread-scoped STM with auto-summarize
+│   ├── long_term_memory.py      # Fact extraction + vector retrieval
+│   └── memory_manager.py        # Unified memory facade
+├── harness_framework/
+│   ├── middleware_plugin_hub.py  # Plugin registry + health gate
+│   ├── sandwich_reasoning.py     # Plan→Execute→Verify harness
+│   ├── deterministic_linter.py  # Output validation harness
+│   ├── isolation_guard.py       # Child agent context isolation
+│   ├── context_optimizer.py     # Mailbox compression harness
+│   └── janitor_daemon.py        # Background cleanup daemon
+├── mcp_ecosystem/
+│   ├── server_manager.py        # MCP server lifecycle
+│   ├── pipeline_manager.py      # Tool pipeline orchestration
+│   └── mcp_agent.py             # MCP-aware agent wrapper
+├── skill_system/
+│   ├── initializer.py           # Virtual FS + tool generation
+│   └── main_skill_agent.py      # Skill execution agent
+├── function_calling/
+│   ├── tool_registry.py         # Tool registration & schema
+│   └── builtin_tools.py         # Built-in tool implementations
+├── multi_agent/
+│   ├── swarm_router.py          # Swarm-style agent routing
+│   └── team_network.py          # Team network topology
+├── llm/
+│   ├── llm_factory.py           # Multi-provider LLM factory
+│   └── model_config.py          # Model configuration
+├── database/
+│   ├── models.py                # SQLAlchemy models
+│   ├── crud.py                  # Async CRUD operations
+│   ├── vector_store.py          # Vector DB abstraction
+│   └── session_store.py         # Session persistence
+└── frontend/
+    └── src/
+        ├── App.tsx              # Root app with model selector
+        ├── components/
+        │   ├── ChatWindow.tsx   # Message list + scroll management
+        │   ├── MessageBubble.tsx # Think block + tool cards + Markdown
+        │   ├── InputBox.tsx     # Input with send controls
+        │   └── ActionStatusBar.tsx # Global status display
+        └── store/
+            └── chatStore.ts     # Zustand state (messages, models, SSE)
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.10+
+- Node.js 18+
+- An LLM API key (OpenAI-compatible endpoint)
+
+### Backend
+
+```bash
+cd EverLoop
+pip install -r requirements.txt
+
+# Configure your LLM endpoint
+cp .env.example .env
+# Edit .env: set API_KEY, BASE_URL, MODEL_NAME
+
+python main.py
+# Server starts on http://127.0.0.1:8001
+```
+
+### Frontend
+
+```bash
+cd EverLoop/frontend
+npm install
+npm run dev
+# UI available on http://localhost:5173
+```
+
+---
+
+## Configuration
+
+Key environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `LLM_API_KEY` | API key for your LLM provider |
+| `LLM_BASE_URL` | OpenAI-compatible base URL |
+| `LLM_MODEL_NAME` | Model identifier |
+| `DATABASE_URL` | SQLite / PostgreSQL connection string |
+| `JWT_SECRET` | Secret for JWT token signing |
+| `VECTOR_STORE_PATH` | Path for local vector store persistence |
+
+---
+
+## Design Philosophy
+
+**The loop is sacred.** Every optimization — context compression, memory retrieval, plugin health checks — exists to keep the while loop running cleanly without ever compromising the core reasoning path.
+
+**Plugins are guests.** The harness framework ensures that any plugin failure degrades gracefully to the baseline behavior. A broken sandwich_reasoning plugin means ordinary astream inference, not a 500 error.
+
+**Context is a resource.** The 4-stage waterfall compressor treats token budget like memory bandwidth — aggressively reclaimed, never wasted. Tool output that fills 100k tokens gets compressed before the next LLM call, deterministically.
+
+**Streaming is a contract.** The typed SSE packet protocol is the boundary between backend intelligence and frontend rendering. The backend never sends raw `<tool_call>` tags. The frontend never guesses what a packet means.
+
+---
+
+## Tech Stack
+
+**Backend:** Python · FastAPI · LangChain · LangGraph · SQLAlchemy · Aiosqlite · PyJWT · Tiktoken
+
+**Frontend:** React 18 · TypeScript · Vite · Zustand · ReactMarkdown · rehype-highlight · remark-gfm
+
+**AI/ML:** OpenAI API (compatible) · BGE embeddings · Vector store (extensible to Milvus/Qdrant)
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+<div align="center">
+<sub>Built with obsessive attention to context engineering and agent reliability.</sub>
+</div>
