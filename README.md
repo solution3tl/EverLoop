@@ -64,10 +64,6 @@ The name reflects the architecture: a loop that never breaks, never bloats, and 
 
 ## ✨ Core Features
 
-<table>
-<tr>
-<td width="50%">
-
 ### 🔗 Harness Plugin Framework
 A middleware architecture that attaches capabilities to the agent loop without modifying any core code. Plugins are registered in `middleware_plugin_hub`, health-checked on every iteration, and auto-disabled when fault rate exceeds threshold.
 
@@ -78,9 +74,6 @@ A middleware architecture that attaches capabilities to the agent loop without m
 | `isolation_guard` | Cuts parent context when spawning child agents, preventing cognitive contamination |
 | `context_optimizer` | Compresses mailbox history in long-running sub-agent calls |
 | `janitor_daemon` | Background async cleanup of expired sessions and orphaned tool results |
-
-</td>
-<td width="50%">
 
 ### 🧠 Layered Memory System
 
@@ -93,10 +86,6 @@ A middleware architecture that attaches capabilities to the agent loop without m
 - Extracts user facts and preferences from each session
 - Vector-store backed semantic retrieval (BGE / Milvus extensible)
 - Injected at Step 1 of every new conversation as grounding context
-
-</td>
-</tr>
-</table>
 
 ---
 
