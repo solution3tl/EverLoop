@@ -1,0 +1,162 @@
+EverLoop / harness_framework 功能总览
+=====================================
+生成日期：2026-04-06
+
+该框架共 6 个模块，作为可插拔的工程化基础设施挂载在主系统之上，
+目标是提升 Agent 系统的可靠性、安全性与可维护性。
+
+─────────────────────────────────────────────────────────────
+1. context_optimizer.py — 上下文压缩优化器
+─────────────────────────────────────────────────────────────
+问题：文档超长时，LLM 的注意力会在上下文中段衰退，导致遗漏关键信息。
+
+功能：
+  · compress_to_directory(document, doc_id)
+      当传入文档行数超过阈值（默认 100 行）时，自动生成"摘要目录"：
+        - 提取所有 Markdown 标题（# 开头）作为章节索引
+        - 截取前 50 行作为内容预览
+        - 原文缓存至内部 dict，供按需加载
+      行数未超阈值时直接返回原文，零开销。
+
+  · fetch_section(doc_id, section_id)
+      从缓存中按需加载原文或指定行段，供下游工具调用。
+
+  · compress_mailbox(messages)
+      将 team_network mailbox 的消息列表压缩为纯文本摘要，
+      每条消息截取前 200 字符，减少多 Agent 通信的 Token 消耗。
+
+─────────────────────────────────────────────────────────────
+2. deterministic_linter.py — 确定性格式与安全校验器
+─────────────────────────────────────────────────────────────
+问题：用 Prompt 软规则约束 Agent 输出格式，稳定性差、难以量化。
+
+功能：
+  · validate_output(output, output_type, rules)
+      对 Agent 输出做硬性校验，支持三种类型：
+        - json：解析 JSON，不合法即报错
+        - python_code：AST 语法检查 + 安全扫描（禁止 os.system /
+          subprocess / eval / exec / __import__ / 写文件 open("w")）
+        - markdown：检查代码块是否成对闭合，标题层级不得跳跃
+      支持追加业务规则：no_external_urls / max_length_500 / no_empty_output
+
+  · auto_disable_if_needed(error_rate)
+      当校验错误率超过 80% 时（说明规则配置异常），自动调用
+      middleware_plugin_hub.disable_plugin() 降级禁用自身，
+      防止误拦截导致系统瘫痪。
+
+─────────────────────────────────────────────────────────────
+3. sandwich_reasoning.py — 三明治算力分配器
+─────────────────────────────────────────────────────────────
+问题：复杂任务全程使用大模型成本高；全程使用小模型质量差。
+
+功能：
+  · arun_sandwich(task, planning_llm, execution_llm, verification_llm)
+      将一次完整任务拆为三段流水线：
+
+      ① 规划（大模型）
+          生成结构化执行计划（JSON），包含步骤列表、期望输出格式、
+          成功判断标准。
+
+      ② 执行（轻量模型，带重试）
+          按计划生成实际输出；每次结果经 DeterministicLinter 校验，
+          不合格则附上失败原因重新执行，最多重试 max_execution_retries 次
+          （默认 3 次）。
+
+      ③ 验证（大模型）
+          对执行结果做语义层面的质量评估（passed / reason / suggestions）；
+          若未通过，触发一次最终补救重执行。
+
+  默认状态：插件注册表中 enabled_by_default=False（按需手动启用），
+  依赖 deterministic_linter 插件先行启用。
+
+─────────────────────────────────────────────────────────────
+4. isolation_guard.py — 上下文隔离墙
+─────────────────────────────────────────────────────────────
+问题：父 Agent 直接接收子 Agent 的全量输出，导致 Token 浪费和
+      "认知污染"（无关中间步骤干扰父 Agent 判断）。
+
+功能：
+  · wrap_child_agent(child_agent_ainvoke, result_summarizer_llm)
+      工厂函数，将子 Agent 的 ainvoke 包装为隔离版本：
+        - 调用子 Agent 并拿到完整输出
+        - 若输出超过 500 字符且提供了摘要 LLM，调用摘要 LLM 将其压缩
+          为 2-3 句核心摘要后返回给父 Agent
+        - 摘要失败时截断返回，不抛异常
+
+  · create_isolated_context(base_messages, isolation_level)
+      创建隔离版的消息列表：
+        - "full" / "partial"：子 Agent 只继承 SystemMessage（人设 + 工具描述），
+          不共享任何历史对话
+        - 其他值：深拷贝完整消息列表（不共享引用，防止状态互污）
+
+─────────────────────────────────────────────────────────────
+5. janitor_daemon.py — 熵治理后台守护进程
+─────────────────────────────────────────────────────────────
+问题：长期运行的 Agent 系统会积累过期会话、僵尸记忆、废弃 MCP Server，
+      导致存储膨胀和数据一致性下降。
+
+功能（在 main.py lifespan 中以 asyncio 后台任务启动）：
+
+  · cleanup_inactive_sessions()   每 1 小时执行
+      清理超过 7 天未活跃的会话记录。
+
+  · cleanup_expired_memories()    每天凌晨 02:00 执行
+      删除数据库中已过期的记忆条目。
+
+  · cleanup_stale_mcp_servers()   每天凌晨 03:00 执行
+      禁用超过 30 天未被调用的 MCP Server。
+
+  · sync_knowledge_docs()         每 7 天执行
+      扫描向量库集合并记录日志（当前为观察模式，不自动修复）。
+
+  · start_janitor()
+      统一启动以上四个任务，返回 asyncio.Task 列表供 lifespan 持有。
+
+─────────────────────────────────────────────────────────────
+6. middleware_plugin_hub.py — 可拆卸插件管理器
+─────────────────────────────────────────────────────────────
+问题：随着模型能力进化，部分 harness 组件会从"必要"变为"冗余"，
+      需要在不重启、不改核心代码的情况下动态挂载或废弃。
+
+功能：
+
+  · register_plugin(name, plugin_class, enabled_by_default, depends_on)
+      向全局注册表（PLUGIN_REGISTRY）注册插件元数据，
+      支持声明插件间依赖关系。
+
+  · enable_plugin(name) / disable_plugin(name)
+      运行时启用或禁用插件；禁用前检查是否有其他活跃插件依赖它。
+
+  · get_active_plugin(name)
+      获取已激活插件的实例（懒实例化）；未激活返回 None，
+      确保插件缺失时调用方可优雅降级而非崩溃。
+
+  · list_plugins()
+      返回所有插件的名称、启用状态、描述、依赖关系。
+
+  默认注册状态：
+    - context_optimizer      ✓ 默认启用
+    - deterministic_linter   ✓ 默认启用
+    - isolation_guard        ✓ 默认启用
+    - sandwich_reasoning     ✗ 默认关闭（依赖 deterministic_linter）
+
+─────────────────────────────────────────────────────────────
+模块协作关系
+─────────────────────────────────────────────────────────────
+
+  sandwich_reasoning
+      ├── 依赖 deterministic_linter（执行阶段格式校验）
+      └── 由 middleware_plugin_hub 统一管理生命周期
+
+  deterministic_linter
+      └── 错误率过高时主动调用 middleware_plugin_hub.disable_plugin() 自降级
+
+  isolation_guard
+      └── wrap_child_agent 可选接入任意 LLM 作为摘要压缩器
+
+  janitor_daemon
+      └── 完全独立，后台异步运行，不阻塞主流程
+
+  context_optimizer
+      └── 可被任意 Agent 节点在注入上下文前调用，也供 team_network 的
+          mailbox 压缩使用
