@@ -24,9 +24,14 @@
 
 ## 🤔 What is EverLoop?
 
-EverLoop is not just another chatbot wrapper. It is an **engineering-first autonomous agent framework** built around a strict 7-step while-loop paradigm. Every conversation turn goes through context cleaning, LTM retrieval, LLM reasoning, tool execution, and memory persistence — all governed by a plugin system that attaches to the loop with **zero intrusion into core logic**.
+本项目是对 3 月 31 日 Claude Code 源码泄露事件的技术致敬与深度演进。我们在第一时间剥离并复现了其底层极其优秀的自主 Agent 运转机制，并在此基础上重新设计、抽象出了一套完整的工程化框架。
 
-The name reflects the architecture: a loop that never breaks, never bloats, and never forgets what matters.
+EverLoop 的核心建立在一个严密的 7 步 `while` 循环范式之上。每一次对话轮次都会精准调度以下核心模块：
+* **上下文工程 (Context Engineering)：** 内置 4 级瀑布式压缩与语义降噪，确保极高频的工具输出绝不污染 Token 池。
+* **分层记忆管理 (Layered Memory)：** 将线程级的短期记忆 (STM) 与基于向量检索的长期记忆 (LTM) 无缝解耦。
+* **可靠工具调用 (Tool Calling & MCP)：** 支持标准化外部工具接入与沙盒执行。
+* **Harness 插件体系：** 以**对核心逻辑零侵入**的方式挂载各类守卫（Guard）、拦截器（Linter）与清理守护进程。
+
 
 ---
 
