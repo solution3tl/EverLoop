@@ -45,50 +45,39 @@ EverLoop 是一个面向 **自主 Agent Runtime** 的工程化项目。它不是
 
 ---
 
-## Why this README is structured this way
+## Feature Showcase
 
-如果要把项目放到 GitHub 上展示，这个 README 的目标不是“把所有代码都说一遍”，而是优先让别人快速看懂：
+### Workspace / Chat
 
-- 这个项目 **解决什么问题**
-- 这个项目 **和普通聊天 Agent 有什么差异**
-- 你的 **Skill / MCP / Function Calling 设计到底怎么落地**
-- 前端页面 **长什么样、能看到什么**
+主工作台提供对话区、模型选择、状态面板和整体 Agent 运行入口。
 
----
+<div align="center">
+  <img src="./img/1.png" alt="Workspace Page" width="100%" />
+</div>
 
-## UI Showcase
+### MCP Server Center
 
-以下是当前已经完成的核心页面展示：
+集中展示 MCP Server、工具列表、工具 Schema，以及 MCP 能力如何接入主 Agent。
 
-<table>
-  <tr>
-    <td width="50%" valign="top" align="center">
-      <strong>Workspace / Chat</strong><br/>
-      <img src="./img/1.png" alt="Workspace Page" />
-    </td>
-    <td width="50%" valign="top" align="center">
-      <strong>MCP Server Center</strong><br/>
-      <img src="./img/2.png" alt="MCP Page" />
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top" align="center">
-      <strong>Skill Workbench</strong><br/>
-      <img src="./img/3.png" alt="Skills Page" />
-    </td>
-    <td width="50%" valign="top" align="center">
-      <strong>Trace / Tool Timeline</strong><br/>
-      <img src="./img/4.png" alt="Trace Page" />
-    </td>
-  </tr>
-</table>
+<div align="center">
+  <img src="./img/2.png" alt="MCP Page" width="100%" />
+</div>
 
-### Recommended screenshot checklist
+### Skill Workbench
 
-- `img/1.png`：工作台 / 主对话区
-- `img/2.png`：MCP Server 管理与工具展示
-- `img/3.png`：Skill 管理与工作区
-- `img/4.png`：Trace / Tool Timeline / SSE 状态流
+展示 Skill 的管理、启停、组织方式，以及 Skill 如何成为 Agent 的能力入口。
+
+<div align="center">
+  <img src="./img/3.png" alt="Skills Page" width="100%" />
+</div>
+
+### Trace / Tool Timeline
+
+通过可视化调用链展示 SSE 状态流、tool call、observation 和运行过程反馈。
+
+<div align="center">
+  <img src="./img/4.png" alt="Trace Page" width="100%" />
+</div>
 
 ---
 
@@ -426,18 +415,6 @@ LLM_MODEL_NAME=your_model
 JWT_SECRET=your_secret
 DATABASE_URL=sqlite+aiosqlite:///./everloop.db
 ```
-
----
-
-## Suggested next README upgrades
-
-如果你后面还想继续打磨 GitHub 展示，我建议下一步做这几件事：
-
-- [ ] 把 `docs/screenshots/*.svg` 替换成真实页面截图
-- [ ] 增加一张完整的“主 Agent / MCP 子 Agent / Tool 调用链路图”
-- [ ] 补一个 30~60 秒 GIF，展示从提问到 tool trace 的完整流程
-- [ ] 给 `Skill` 和 `MCP` 各补一个 end-to-end demo case
-- [ ] 增加 “Why not direct global MCP tools?” 对比说明
 
 ---
 
