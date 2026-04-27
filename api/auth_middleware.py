@@ -52,7 +52,10 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
 
-        # 白名单路径直接放行
+        # 预检请求和白名单路径直接放行
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         if path in AUTH_WHITELIST or path.startswith("/api/auth/"):
             return await call_next(request)
 

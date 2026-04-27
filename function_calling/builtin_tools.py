@@ -68,25 +68,8 @@ async def calculator(expression: str) -> str:
     except Exception as e:
         return f"计算错误：{str(e)}"
 
-
-@register_tool(metadata={"display_name": "网络搜索", "icon_url": "🔍"})
-async def web_search(query: str, num_results: int = 3) -> str:
-    """搜索互联网信息（演示模式：返回模拟结果）"""
-    # 注：生产环境接入 Tavily/SerpAPI
-    return f"""搜索 "{query}" 的结果（演示模式）：
-
-1. **相关结果 1** - 这是关于 "{query}" 的示例搜索结果。
-   来源：https://example.com/1
-
-2. **相关结果 2** - 更多关于 "{query}" 的信息。
-   来源：https://example.com/2
-
-提示：当前为演示模式，如需真实搜索请配置 TAVILY_API_KEY 环境变量。"""
-
-
 @register_tool(metadata={"display_name": "知识库检索", "icon_url": "📚"})
 async def knowledge_base_search(query: str, top_k: int = 3) -> str:
     """在私有知识库中进行语义检索"""
     # 注：生产环境接入向量数据库
     return f'在知识库中搜索 "{query}"：\n暂无私有知识库，请上传文档后再次检索。'
-

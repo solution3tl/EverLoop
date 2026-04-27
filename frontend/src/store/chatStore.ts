@@ -5,7 +5,7 @@ export interface ToolCallEntry {
   id: string
   toolName: string
   toolArgs: Record<string, unknown>
-  status: 'running' | 'done'
+  status: 'running' | 'done' | 'error'
   resultPreview?: string
 }
 
@@ -24,6 +24,33 @@ export interface ActionStatus {
   message: string
 }
 
+export interface LoopStatusEvent {
+  id: string
+  phase: string
+  message: string
+  status: 'running' | 'done' | 'error'
+  timestamp: Date
+}
+
+export interface StatusTimelineEvent {
+  id: string
+  seq: number
+  kind: 'phase' | 'tool' | 'observation' | 'llm' | 'control'
+  status: 'running' | 'done' | 'error'
+  phase: string
+  message: string
+  toolCallId?: string
+  timestamp: Date
+}
+
+export interface UsageSummary {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  estimatedCostUsd: number
+}
+
 interface ChatStore {
   messages: Message[]
   isStreaming: boolean
@@ -31,6 +58,9 @@ interface ChatStore {
   currentModel: string
   availableModels: string[]
   totalTokensUsed: number
+  loopStatus: LoopStatusEvent[]
+  statusTimeline: StatusTimelineEvent[]
+  usageSummary: UsageSummary
 
   // 文字追加（正式回答）
   appendTextChunk: (chunk: string) => void
@@ -52,8 +82,12 @@ interface ChatStore {
   setAvailableModels: (models: string[]) => void
   clearMessages: () => void
   addTokensUsed: (count: number) => void
+  addLoopStatus: (event: Omit<LoopStatusEvent, 'id' | 'timestamp'>) => void
+  pushStatusTimeline: (event: Omit<StatusTimelineEvent, 'id' | 'seq' | 'timestamp'>) => void
+  finalizeRunningToolCalls: (finalStatus?: 'done' | 'error') => void
+  setUsageSummary: (usage: Partial<UsageSummary>) => void
+  clearLoopState: () => void
 }
-
 let _idCounter = 0
 const genId = () => `msg-${Date.now()}-${++_idCounter}`
 
@@ -87,6 +121,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   currentModel: 'qwen2.5-72b',
   availableModels: [],
   totalTokensUsed: 0,
+  loopStatus: [],
+  statusTimeline: [],
+  usageSummary: {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    estimatedCostUsd: 0,
+  },
 
   appendTextChunk: (chunk) => {
     set((state) => {
@@ -188,9 +231,100 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   clearMessages: () => {
     localStorage.removeItem('everloop_thread_id')
-    set({ messages: [], threadId: null, totalTokensUsed: 0 })
+    set({
+      messages: [],
+      threadId: null,
+      totalTokensUsed: 0,
+      loopStatus: [],
+      statusTimeline: [],
+      usageSummary: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        estimatedCostUsd: 0,
+      },
+    })
   },
 
   addTokensUsed: (count) =>
     set((state) => ({ totalTokensUsed: state.totalTokensUsed + count })),
+
+  addLoopStatus: (event) => {
+    set((state) => ({
+      loopStatus: [
+        ...state.loopStatus,
+        {
+          id: `loop-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+          phase: event.phase,
+          message: event.message,
+          status: event.status,
+          timestamp: new Date(),
+        },
+      ].slice(-40),
+    }))
+  },
+
+  pushStatusTimeline: (event) => {
+    set((state) => ({
+      statusTimeline: [
+        ...state.statusTimeline,
+        {
+          id: `st-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+          seq: state.statusTimeline.length + 1,
+          kind: event.kind,
+          status: event.status,
+          phase: event.phase,
+          message: event.message,
+          toolCallId: event.toolCallId,
+          timestamp: new Date(),
+        },
+      ].slice(-200),
+    }))
+  },
+
+  finalizeRunningToolCalls: (finalStatus = 'done') => {
+    set((state) => {
+      const msgs = [...state.messages]
+      const last = msgs[msgs.length - 1]
+      if (last && last.role === 'assistant') {
+        msgs[msgs.length - 1] = {
+          ...last,
+          toolCalls: last.toolCalls.map((tc) =>
+            tc.status === 'running'
+              ? {
+                  ...tc,
+                  status: finalStatus,
+                  resultPreview: tc.resultPreview || (finalStatus === 'error' ? '[中断/异常结束]' : '[已结束]'),
+                }
+              : tc,
+          ),
+        }
+      }
+      return { messages: msgs }
+    })
+  },
+
+  setUsageSummary: (usage) => {
+    set((state) => ({
+      usageSummary: {
+        ...state.usageSummary,
+        ...usage,
+      },
+    }))
+  },
+
+  clearLoopState: () => {
+    set({
+      loopStatus: [],
+      statusTimeline: [],
+      usageSummary: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        estimatedCostUsd: 0,
+      },
+    })
+  },
 }))

@@ -63,7 +63,7 @@ app = FastAPI(
 origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发阶段放开，生产环境改为 origins
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -338,6 +338,8 @@ async def list_mcp_servers(requester_id: str, is_admin: bool = False) -> List[MC
         return list(result.scalars().all())
 
 
+
+
 async def delete_mcp_server(server_id: str, requester_id: str) -> bool:
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(MCPServer).where(MCPServer.id == server_id))
@@ -347,3 +349,86 @@ async def delete_mcp_server(server_id: str, requester_id: str) -> bool:
         await db.delete(server)
         await db.commit()
         return True
+
+async def list_visible_skills(requester_id: str, is_admin: bool = False) -> List[Skill]:
+    async with AsyncSessionLocal() as db:
+        if is_admin:
+            result = await db.execute(select(Skill))
+        else:
+            from sqlalchemy import or_
+            result = await db.execute(
+                select(Skill).where(
+                    or_(Skill.owner_id == requester_id, Skill.is_public == True)
+                )
+            )
+        return list(result.scalars().all())
+
+
+async def get_skill_by_id(skill_id: str) -> Optional[Skill]:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Skill).where(Skill.id == skill_id))
+        return result.scalar_one_or_none()
+
+
+async def create_skill(
+    name: str,
+    description: str,
+    owner_id: str,
+    package_json: dict = None,
+    is_public: bool = False,
+    version: str = "1.0.0",
+    skill_type: str = "package",
+    enabled: bool = True,
+    mcp_server_id: str = None,
+    mcp_tool_filter: list = None,
+    namespace: str = None,
+) -> Skill:
+    async with AsyncSessionLocal() as db:
+        skill = Skill(
+            id=_gen_id(),
+            name=name,
+            description=description,
+            package_json=package_json or {},
+            owner_id=owner_id,
+            is_public=is_public,
+            version=version,
+            skill_type=skill_type,
+            enabled=enabled,
+            mcp_server_id=mcp_server_id,
+            mcp_tool_filter=mcp_tool_filter or [],
+            namespace=namespace,
+        )
+        db.add(skill)
+        await db.commit()
+        await db.refresh(skill)
+        return skill
+
+
+async def update_skill_enabled(skill_id: str, enabled: bool) -> Optional[Skill]:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Skill).where(Skill.id == skill_id))
+        skill = result.scalar_one_or_none()
+        if not skill:
+            return None
+        skill.enabled = enabled
+        await db.commit()
+        await db.refresh(skill)
+        return skill
+
+
+async def update_skill_schema_sync(
+    skill_id: str,
+    schema_cache: dict,
+    last_error: str = None,
+) -> Optional[Skill]:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Skill).where(Skill.id == skill_id))
+        skill = result.scalar_one_or_none()
+        if not skill:
+            return None
+        skill.schema_cache = schema_cache or {}
+        skill.schema_synced_at = datetime.utcnow()
+        skill.last_error = last_error
+        await db.commit()
+        await db.refresh(skill)
+        return skill

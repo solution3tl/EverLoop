@@ -94,6 +94,14 @@ class Skill(Base):
     owner_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     is_public = Column(Boolean, default=False)
     version = Column(String(32), default="1.0.0")
+    skill_type = Column(String(16), default="package")  # package / mcp
+    enabled = Column(Boolean, default=True)
+    mcp_server_id = Column(String(36), nullable=True)
+    mcp_tool_filter = Column(JSON, default=list)
+    namespace = Column(String(128), nullable=True)
+    schema_cache = Column(JSON, default=dict)
+    schema_synced_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
