@@ -1,14 +1,29 @@
 """
-模型配置中心 - 从环境变量读取各模型的接入参数
+模型配置中心 - 从环境变量与 .env 读取模型接入参数
 """
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
-from dotenv import load_dotenv
 
-load_dotenv()
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen2.5-72b")
+def _read_env_file() -> Dict[str, str]:
+    env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    values: Dict[str, str] = {}
+    if not os.path.exists(env_file):
+        return values
+
+    with open(env_file, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+ENV_FILE_VALUES = _read_env_file()
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL") or ENV_FILE_VALUES.get("DEFAULT_MODEL", "qwen2.5-72b")
 
 
 @dataclass
@@ -23,47 +38,47 @@ class ModelConfig:
     is_default: bool = False
 
 
+def _get_env_value(key: str, env_file_values: Dict[str, str]) -> Optional[str]:
+    # 优先读取进程环境变量，再回退 .env 文件；兼容 Windows 大写环境键
+    return os.getenv(key) or os.getenv(key.upper()) or env_file_values.get(key) or env_file_values.get(key.upper())
+
+
 def _load_model_registry() -> Dict[str, ModelConfig]:
-    """从环境变量动态加载所有模型配置"""
     registry: Dict[str, ModelConfig] = {}
 
-    # 先读取 .env 文件内容获取原始大小写的 key（os.environ 在 Windows 会转大写）
-    env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-    raw_model_names: Dict[str, str] = {}  # upper_key -> original_name
-    if os.path.exists(env_file):
-        with open(env_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("LLM_ENDPOINT__") and "=" in line:
-                    raw_key = line.split("=")[0]
-                    orig_name = raw_key[len("LLM_ENDPOINT__"):]
-                    raw_model_names[orig_name.upper()] = orig_name
-
-    # 扫描所有 LLM_ENDPOINT__ 开头的环境变量
-    for key, value in os.environ.items():
+    endpoint_keys = set()
+    for key in os.environ.keys():
         if key.startswith("LLM_ENDPOINT__"):
-            env_model_upper = key[len("LLM_ENDPOINT__"):]
-            # 优先使用 .env 里的原始大小写名，否则用 upper 版本
-            model_name = raw_model_names.get(env_model_upper, env_model_upper)
+            endpoint_keys.add(key)
+    for key in ENV_FILE_VALUES.keys():
+        if key.startswith("LLM_ENDPOINT__"):
+            endpoint_keys.add(key)
 
-            api_key_env = f"LLM_API_KEY__{env_model_upper}"
-            api_key = os.getenv(api_key_env, "none")
+    for endpoint_key in endpoint_keys:
+        model_name = endpoint_key[len("LLM_ENDPOINT__"):]
+        if not model_name:
+            continue
 
-            registry[model_name] = ModelConfig(
-                provider=model_name,
-                api_key=api_key,
-                base_url=value,
-                model_name=model_name,
-                is_default=(model_name.lower() == DEFAULT_MODEL.lower()),
-            )
+        endpoint = _get_env_value(endpoint_key, ENV_FILE_VALUES)
+        if not endpoint:
+            continue
 
-    # 如果没有读到任何配置，添加一个本地 fallback
+        api_key = _get_env_value(f"LLM_API_KEY__{model_name}", ENV_FILE_VALUES) or "none"
+
+        registry[model_name] = ModelConfig(
+            provider=model_name,
+            api_key=api_key,
+            base_url=endpoint,
+            model_name=model_name,
+            is_default=(model_name.lower() == DEFAULT_MODEL.lower()),
+        )
+
     if not registry:
-        registry["local"] = ModelConfig(
-            provider="local",
+        registry["qwen2.5-72b"] = ModelConfig(
+            provider="qwen2.5-72b",
             api_key="none",
             base_url="http://localhost:11434/v1",
-            model_name="llama3",
+            model_name="qwen2.5-72b",
             is_default=True,
         )
 
@@ -74,19 +89,31 @@ MODEL_REGISTRY: Dict[str, ModelConfig] = _load_model_registry()
 
 
 def get_default_config() -> ModelConfig:
-    """获取默认模型配置"""
     for config in MODEL_REGISTRY.values():
         if config.is_default:
             return config
-    # fallback: 返回第一个
+
+    for config in MODEL_REGISTRY.values():
+        if config.model_name.lower() == "qwen2.5-72b":
+            return config
+
     return next(iter(MODEL_REGISTRY.values()))
 
 
 def get_config(provider: str) -> Optional[ModelConfig]:
-    """按 provider 名称精确返回配置"""
-    return MODEL_REGISTRY.get(provider)
+    if not provider:
+        return None
+
+    exact = MODEL_REGISTRY.get(provider)
+    if exact:
+        return exact
+
+    low = provider.lower()
+    for key, cfg in MODEL_REGISTRY.items():
+        if key.lower() == low:
+            return cfg
+    return None
 
 
 def list_models() -> list:
-    """列出所有可用模型名称"""
     return list(MODEL_REGISTRY.keys())

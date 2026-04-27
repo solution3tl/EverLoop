@@ -23,11 +23,13 @@ class MCPAgent:
         mcp_server: MCPServer,
         enabled_memory: bool = False,
         knowledge_store_id: Optional[str] = None,
+        tool_filter: Optional[list[str]] = None,
     ):
         self.llm = llm
         self.mcp_server = mcp_server
         self.enabled_memory = enabled_memory
         self.knowledge_store_id = knowledge_store_id
+        self.tool_filter = tool_filter or []
         self._tools_schema = []
         self._initialized = False
 
@@ -43,6 +45,9 @@ class MCPAgent:
                 requester_id=str(self.mcp_server.owner_id),
                 is_admin=True,
             )
+            if self.tool_filter:
+                allow = set(self.tool_filter)
+                schema = [s for s in schema if (s.get("function", {}).get("name") in allow)]
             self._tools_schema = schema
         except Exception as e:
             print(f"[WARN] MCPAgent {self.mcp_server.name} 获取工具 Schema 失败：{e}")
@@ -70,6 +75,12 @@ class MCPAgent:
         await self._prepare_context()
 
         # 子 Agent 上下文隔离
+        if not parent_thread_id:
+            try:
+                from core.middleware import get_thread_id
+                parent_thread_id = get_thread_id() or ""
+            except Exception:
+                parent_thread_id = ""
         child_thread_id = f"{parent_thread_id}:mcp:{self.mcp_server.id}"
 
         # 获取当前请求的 stream_writer
@@ -83,5 +94,6 @@ class MCPAgent:
             tools_schema=self._tools_schema,
             llm=self.llm,
             stream_writer=writer,
+            child_thread_id=child_thread_id,
         )
         return result

@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 from database import crud
 from database.models import MCPServer
+from mcp_ecosystem import client as mcp_client
 
 
 class PermissionDeniedError(Exception):
@@ -91,42 +92,32 @@ async def parse_server_tools_schema(
     ui_metadata = []
 
     try:
-        headers = {}
-        if server.auth_type == "apikey" and server.auth_credential:
-            headers["Authorization"] = f"Bearer {server.auth_credential}"
+        raw_tools, transport = await mcp_client.list_tools(server)
+        for tool in raw_tools:
+            tool_name = tool.get("name", "")
+            description = tool.get("description", "")
+            parameters = tool.get("inputSchema") or tool.get("input_schema") or {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{server.endpoint_url}/tools/list",
-                headers=headers,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                raw_tools = data.get("tools", [])
-                for tool in raw_tools:
-                    tool_name = tool.get("name", "")
-                    description = tool.get("description", "")
-                    parameters = tool.get("inputSchema", {
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    })
-
-                    tools_schema.append({
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "description": description,
-                            "parameters": parameters,
-                        }
-                    })
-                    ui_metadata.append({
-                        "tool_name": tool_name,
-                        "display_name": tool.get("display_name", tool_name),
-                        "description": description,
-                        "server_id": server_id,
-                        "server_name": server.name,
-                    })
+            tools_schema.append({
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            })
+            ui_metadata.append({
+                "tool_name": tool_name,
+                "display_name": tool.get("display_name", tool_name),
+                "description": description,
+                "server_id": server_id,
+                "server_name": server.name,
+                "transport": transport,
+            })
     except Exception as e:
         print(f"[WARN] 获取 MCP Server {server.name} 工具列表失败：{e}")
 

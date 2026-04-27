@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from core.streaming_handler import stream_chat_response, StreamContext
-from init.general_agent import get_or_init_agent
+from init.general_agent import get_or_init_agent, create_agent_for_request
 from langchain_core.messages import HumanMessage
 
 router = APIRouter()
@@ -27,8 +27,18 @@ async def chat_stream(req: ChatRequest, request: Request):
     user_id = getattr(request.state, "user_id", "anonymous")
     thread_id = req.thread_id or str(uuid.uuid4())[:8]
 
-    # 确保 AgentLoop 已初始化
-    agent_loop = await get_or_init_agent(req.model_name)
+    from llm.model_config import get_default_config
+    requested_model = (req.model_name or "").strip() or get_default_config().provider
+
+    try:
+        agent_loop = await create_agent_for_request(
+            user_id=str(user_id),
+            is_admin=bool(getattr(request.state, "is_admin", False)),
+            model_name=requested_model,
+        )
+    except Exception:
+        # 指定模型初始化失败时回退默认模型，保证可用性
+        agent_loop = await get_or_init_agent(None)
 
     user_message = HumanMessage(content=req.message)
     stream_ctx = StreamContext()
@@ -85,7 +95,7 @@ async def list_models():
     default = get_default_config()
     return {
         "models": get_available_models(),
-        "default": default.provider if default else None,
+        "default": default.provider,
     }
 
 

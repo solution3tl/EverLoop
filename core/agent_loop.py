@@ -1,58 +1,82 @@
 """
 自主行动循环 (Agentic Loop)
-严格按照 7 步 while 循环范式实现，第一步始终在循环内部执行：
-
-while True:
-    0. [Harness] isolation_guard: 子 Agent 上下文隔离 / context_optimizer: mailbox 压缩
-    1. 预处理：调用 ContextPipeline.prepare(stm, ...)
-       - LTM RAG 检索（向量库语义召回历史画像/偏好）
-       - 环境状态读取（当前时间、系统状态）
-       - SemanticNoiseFilter（Snip + Microcompact + 格式拦截）
-       - WaterfallCompressor（4 级瀑布流压缩，结果写回 stm）
-       - StateOrganizer（头部锚定系统提示 + 尾部潜意识注入）
-    2. 判断前提：迭代次数 / 工具次数上限 + [Harness] 插件健康度熔断
-    3. 调用 LLM 推理（[Harness] sandwich_reasoning 按需拦截）
-    4. 检查结果：tool_calls vs 最终回答 + [Harness] deterministic_linter 硬校验
-    5. 执行工具，写回 ShortTermMemory；子 Agent 结果经 [Harness] wrap_child_agent 摘要
-    6. 判断终止条件（已在 4/5 中 break）
-    7. 进入下一轮
-
-生命周期外层（不参与 while 循环）：
-    - janitor_daemon  : FastAPI lifespan 中启动，后台异步清理
-    - middleware_plugin_hub : __init__ 注册，提供插件开关总线
+重构点：显式 State + transition 消费机制 + plan→tool→observation 闭环。
 """
 import asyncio
 import inspect
+import json
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Callable, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import (
-    HumanMessage,
-    AIMessage,
-    ToolMessage,
-)
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from core.context_pipeline import ContextPipeline
+from core.observability import ToolCallTimer
+from core.token_counter import count_str_tokens
+from function_calling.fc_validator import validate_tool_call_against_schema
+from skill_system.weather_skill import detect_weather_tool_args
 
-MAX_ITERATIONS = 20    # 最大循环轮次
-MAX_TOOL_CALLS = 10    # 单次对话最大工具调用次数
+MAX_ITERATIONS = 20
+MAX_TOOL_CALLS = 10
+MAX_OUTPUT_RECOVERY_LIMIT = 3
+MAX_OUTPUT_ESCALATED_TOKENS = 64000
+DEFAULT_MAX_BUDGET_USD = 3.0
+DEFAULT_MODEL_NAME = "qwen2.5-72b"
 
-# 触发 sandwich_reasoning 的最小任务描述长度（字符）
 SANDWICH_TASK_MIN_LEN = 200
+
+TransitionType = Literal[
+    "next_turn",
+    "collapse_drain_retry",
+    "reactive_compact_retry",
+    "max_output_tokens_escalate",
+    "max_output_tokens_recovery",
+    "stop_hook_blocking",
+    "token_budget_continuation",
+]
+
+
+@dataclass
+class UsageStats:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+
+    def add(self, other: "UsageStats") -> None:
+        self.input_tokens += other.input_tokens
+        self.output_tokens += other.output_tokens
+        self.cache_read_input_tokens += other.cache_read_input_tokens
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens
+
+
+@dataclass
+class ToolUseContext:
+    agent_id: str
+    tools: List[Dict]
+    read_file_cache: Dict[str, str] = field(default_factory=dict)
+    abort_controller: asyncio.Event = field(default_factory=asyncio.Event)
+    on_progress: Optional[Callable[..., Any]] = None
+
+
+@dataclass
+class AgentState:
+    messages: List[Any]
+    tool_use_context: ToolUseContext
+    auto_compact_tracking: Optional[Dict[str, Any]] = None
+    max_output_tokens_recovery_count: int = 0
+    has_attempted_reactive_compact: bool = False
+    max_output_tokens_override: Optional[int] = None
+    pending_tool_use_summary: Optional[asyncio.Task] = None
+    stop_hook_active: Optional[bool] = None
+    turn_count: int = 0
+    transition: Optional[TransitionType] = None
 
 
 class AgentLoop:
-    """
-    自主行动循环实例。
-    每次对话调用 arun()，在 while 循环内完全自控：
-    上下文预处理 → 前提判断 → LLM 推理 → 工具执行 → 记忆更新 → 终止判断。
-
-    Harness 切面以「零侵入」方式嵌入各步骤：
-      所有 harness 组件通过 middleware_plugin_hub.get_active_plugin() 按名取用，
-      返回 None 时自动降级为原生逻辑，不抛异常。
-    """
-
     def __init__(
         self,
         llm: BaseChatModel,
@@ -60,10 +84,10 @@ class AgentLoop:
         tools_schema: List[Dict],
         system_prompt: str = "",
         memory_manager=None,
-        # Harness: 可选注入子 Agent 摘要用轻量 LLM（不传则跳过摘要）
         summarizer_llm: Optional[BaseChatModel] = None,
-        # Harness: 当前实例是否作为子 Agent 运行（影响上下文隔离策略）
         is_child_agent: bool = False,
+        model_name: str = DEFAULT_MODEL_NAME,
+        max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
     ):
         self._llm = llm
         self._tools_map = tools_map
@@ -72,8 +96,9 @@ class AgentLoop:
         self._memory_manager = memory_manager
         self._summarizer_llm = summarizer_llm
         self._is_child_agent = is_child_agent
+        self._model_name = model_name
+        self._max_budget_usd = max_budget_usd
 
-        # 绑定工具 schema 到 LLM
         if self._tools_schema:
             self._llm_with_tools = self._llm.bind_tools(
                 [s["function"] if "function" in s else s for s in self._tools_schema]
@@ -81,15 +106,9 @@ class AgentLoop:
         else:
             self._llm_with_tools = self._llm
 
-        # 预处理流水线（stateless，每次对话复用同一实例）
         summary_llm = memory_manager._summary_llm if memory_manager else None
-        self._pipeline = ContextPipeline(
-            system_prompt=system_prompt,
-            summary_llm=summary_llm,
-        )
+        self._pipeline = ContextPipeline(system_prompt=system_prompt, summary_llm=summary_llm)
 
-        # ── Harness: middleware_plugin_hub ────────────────────────
-        # 确保默认插件已注册（模块首次 import 时会自动注册，这里作保险触发）
         try:
             from harness_framework.middleware_plugin_hub import _register_default_plugins
             _register_default_plugins()
@@ -102,61 +121,92 @@ class AgentLoop:
         thread_id: str,
         user_id: str = "",
         stream_ctx=None,
-        # Harness: 传入父 Agent 的 messages 供 isolation_guard 使用（子 Agent 模式）
         parent_messages: Optional[List] = None,
-        # Harness: 若为 sandwich 模式，可指定轻量执行 LLM（不传则用主 LLM）
         execution_llm: Optional[BaseChatModel] = None,
     ) -> str:
-        """
-        主入口：执行完整的自主行动循环。
-        返回最终回答文本，同时通过 stream_ctx 实时推送流式事件。
-        """
-        iteration = 0
-        tool_call_count = 0
         full_response = ""
         force_stop = False
+        tool_call_count = 0
+        total_usage = UsageStats()
 
-        # ── Step 0 [Harness]: isolation_guard — 子 Agent 上下文隔离 ──
-        # 若当前实例作为子 Agent 运行且父上下文已传入，则切断父历史，
-        # 只保留 SystemMessage（人设 + 工具描述），防止认知污染。
-        # 提取到的隔离系统消息列表将在流水线 prepare() 前注入 STM。
         isolation_base_messages: List = []
         if self._is_child_agent and parent_messages:
             try:
                 from harness_framework.isolation_guard import create_isolated_context
-                isolation_base_messages = create_isolated_context(
-                    parent_messages, isolation_level="full"
-                )
+                isolation_base_messages = create_isolated_context(parent_messages, isolation_level="full")
             except Exception:
                 pass
 
-        # 获取 ShortTermMemory；子 Agent 模式下先写入隔离基底（仅 SystemMessage），
-        # 再写入本轮用户消息，确保父 Agent 的历史对话不进入本 STM。
         stm = await self._get_stm(thread_id)
         if isolation_base_messages:
             for base_msg in isolation_base_messages:
                 stm.messages.append(base_msg)
         await stm.add_message_async(user_message)
 
-        while True:
-            iteration += 1
+        state = AgentState(
+            messages=stm.get_messages(),
+            tool_use_context=ToolUseContext(
+                agent_id=f"agent-{thread_id}",
+                tools=self._tools_schema,
+            ),
+        )
 
-            # ── Step 1: 预处理 ────────────────────────────────────────
-            #
-            # 设计目标：像一个拥有极高洁癖的安检员，把原始记忆洗得干干净净、
-            # 压得严严实实，并且绝对不破坏大模型 API 的底层语法规则。
-            #
-            # 直接传入 stm 对象（而非快照），流水线内部：
-            #   ① 读 stm 当前状态 → 内存拷贝进行清洗
-            #   ② 将压缩后的结果写回 stm（防止下轮加载数据库时垃圾复活）
-            #   ③ 返回最终组装好的 messages 列表喂给 LLM
-            #
-            # 同时在此步骤内完成：
-            #   • LTM RAG 检索：基于用户最新消息，向量语义召回历史画像/偏好
-            #   • 环境状态读取：当前时间精确到秒，注入 System Prompt
-            #
-            # 工具写回 10 万字日志后，下一轮必经此处清洗压缩，绝不会撑爆
-            #
+        routed_response = await self._try_direct_weather_skill_route(
+            user_message=user_message,
+            stm=stm,
+            stream_ctx=stream_ctx,
+        )
+        if routed_response is not None:
+            return routed_response
+
+        routed_response = await self._try_direct_date_route(
+            user_message=user_message,
+            stm=stm,
+            stream_ctx=stream_ctx,
+        )
+        if routed_response is not None:
+            return routed_response
+
+        while True:
+            consumed_transition = state.transition
+            state.transition = None
+            if consumed_transition:
+                await self._push(
+                    stream_ctx,
+                    "loop_status",
+                    phase="transition",
+                    status="running",
+                    message=f"消费 transition: {consumed_transition}",
+                )
+
+            if consumed_transition == "reactive_compact_retry":
+                state.max_output_tokens_override = MAX_OUTPUT_ESCALATED_TOKENS
+
+            if force_stop or state.turn_count >= MAX_ITERATIONS:
+                msg = f"\n[系统：已达到最大推理轮次 {MAX_ITERATIONS}，强制终止]"
+                await self._push(stream_ctx, "text", content=msg)
+                full_response += msg
+                break
+
+            if tool_call_count >= MAX_TOOL_CALLS:
+                msg = f"\n[系统：工具调用次数超过上限 {MAX_TOOL_CALLS}，已停止]"
+                await self._push(stream_ctx, "text", content=msg)
+                full_response += msg
+                break
+
+            if self._estimate_total_cost(total_usage) >= self._max_budget_usd:
+                msg = f"\n[系统：预算已达 ${self._estimate_total_cost(total_usage):.4f}，停止执行]"
+                await self._push(stream_ctx, "text", content=msg)
+                full_response += msg
+                break
+
+            if not self._check_plugin_health():
+                msg = "\n[系统：核心中间件健康检查失败，本轮推理已中止]"
+                await self._push(stream_ctx, "text", content=msg)
+                full_response += msg
+                break
+
+            await self._push(stream_ctx, "loop_status", phase="compact_check", status="running", message="上下文压缩检查")
             env_state = self._read_env_state()
             ltm_snippets = await self._retrieve_ltm(
                 user_id=user_id,
@@ -167,31 +217,14 @@ class AgentLoop:
                 env_state=env_state,
                 ltm_snippets=ltm_snippets,
             )
+            state.messages = list(messages_for_llm)
+            await self._push(stream_ctx, "loop_status", phase="compact_check", status="done", message="压缩检查完成")
 
-            # ── Step 2: 判断前提 ──────────────────────────────────────
-            if force_stop or iteration > MAX_ITERATIONS:
-                termination_msg = f"\n[系统：已达到最大推理轮次 {MAX_ITERATIONS}，强制终止]"
-                await self._push(stream_ctx, "text", content=termination_msg)
-                full_response += termination_msg
-                break
-
-            # [Harness] middleware_plugin_hub — 插件健康度熔断
-            # 若核心插件大面积失效（注册表损坏），拒绝继续本轮推理，防止「带病推理」
-            if not self._check_plugin_health():
-                err_msg = "\n[系统：核心中间件健康检查失败，本轮推理已中止]"
-                await self._push(stream_ctx, "text", content=err_msg)
-                full_response += err_msg
-                break
-
-            # ── Step 3: 执行核心逻辑 - 调用 LLM（真流式）────────────────
-            # [Harness] sandwich_reasoning — 复杂任务算力分配
-            # 触发条件：sandwich 插件已启用 + 任务描述够长（判定为复杂任务）
-            # 拦截后走 大模型规划→轻模型执行→大模型验证 三段流水线；
-            # 否则走 astream 真流式路径。
             user_query = user_message.content if isinstance(user_message.content, str) else ""
             sandwich = self._get_plugin("sandwich_reasoning")
-            if sandwich and len(user_query) >= SANDWICH_TASK_MIN_LEN and iteration == 1:
+            if sandwich and state.turn_count == 0:
                 try:
+                    await self._push(stream_ctx, "loop_status", phase="plan", status="running", message="进入规划模式")
                     exec_llm = execution_llm or self._llm
                     sandwich_result = await sandwich.arun_sandwich(
                         task_description=user_query,
@@ -199,228 +232,153 @@ class AgentLoop:
                         execution_llm=exec_llm,
                         verification_llm=self._llm,
                     )
-                    full_response = sandwich_result
-                    await self._push_text_streaming(stream_ctx, sandwich_result)
-                    await stm.add_message_async(AIMessage(content=sandwich_result))
-                    break  # sandwich 完成即视为最终回答，退出循环
-                except Exception:
-                    pass  # sandwich 失败降级为普通推理
-
-            # ── astream 真流式推理 ─────────────────────────────────────
-            # 使用 astream() 逐 chunk 推送，避免等待全量响应。
-            # 支持三种内容块：
-            #   · think 块（<think>…</think> 或 chunk.additional_kwargs["thinking"]）
-            #   · text 块（正式回答文字，打字机效果）
-            #   · tool_call 块（工具调用信息，累积后在 Step 4 处理）
-            # 同时过滤「<tool_call> … </tool_call>」内联格式，防止原始 JSON 泄露前端。
-            response = None
-            streamed_text = ""         # 累积最终文字（用于写回 STM）
-            tool_calls_accumulated = []  # 累积 tool_call 增量块
-            thinking_started = False   # 是否已推送过 think 块
-
-            try:
-                async for chunk in self._llm_with_tools.astream(messages_for_llm):
-                    # ① 收集最终 response 对象（取最后一个有效 chunk）
-                    if response is None:
-                        response = chunk
+                    if isinstance(sandwich_result, str) and sandwich_result.strip().startswith("<PLAN>"):
+                        await stm.add_message_async(AIMessage(content=sandwich_result))
+                        await self._push(stream_ctx, "loop_status", phase="plan", status="done", message="规划阶段完成，进入执行循环")
                     else:
-                        try:
-                            response = response + chunk
-                        except Exception:
-                            response = chunk
+                        full_response = sandwich_result
+                        await self._push_text_streaming(stream_ctx, sandwich_result)
+                        await stm.add_message_async(AIMessage(content=sandwich_result))
+                        await self._push(stream_ctx, "loop_status", phase="plan", status="done", message="规划阶段完成")
+                        break
+                except Exception:
+                    await self._push(stream_ctx, "loop_status", phase="plan", status="error", message="规划阶段失败，降级常规循环")
 
-                    # ② 处理 think 块（推理模型专属，如 DeepSeek-R1 / QwQ）
-                    # 来源 A：chunk.additional_kwargs["thinking"]（Claude / 部分 OpenAI 兼容模型）
-                    think_text = ""
-                    ak = getattr(chunk, "additional_kwargs", {}) or {}
-                    if ak.get("thinking"):
-                        think_text = ak["thinking"]
+            await self._push(stream_ctx, "loop_status", phase="llm", status="running", message="调用模型进行推理")
+            llm_result = await self._invoke_llm_streaming(
+                state=state,
+                messages_for_llm=messages_for_llm,
+                stream_ctx=stream_ctx,
+            )
+            llm_status = llm_result.get("llm_status", "done")
+            if llm_status == "error":
+                await self._push(stream_ctx, "loop_status", phase="llm", status="error", message="模型推理失败")
+            else:
+                await self._push(stream_ctx, "loop_status", phase="llm", status="done", message="模型推理完成")
 
-                    # 来源 B：content 列表中 type=="thinking" 的块（Anthropic 原生格式）
-                    raw_content = chunk.content if hasattr(chunk, "content") else ""
-                    if isinstance(raw_content, list):
-                        for block in raw_content:
-                            if isinstance(block, dict) and block.get("type") == "thinking":
-                                think_text += block.get("thinking", "")
-                        # 只取 text 类型作为正式输出
-                        text_parts = [
-                            b.get("text", "") for b in raw_content
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        ]
-                        raw_content = "".join(text_parts)
+            total_usage.add(llm_result["usage"])
+            await self._push(
+                stream_ctx,
+                "usage_update",
+                usage={
+                    "input_tokens": total_usage.input_tokens,
+                    "output_tokens": total_usage.output_tokens,
+                    "cache_read_input_tokens": total_usage.cache_read_input_tokens,
+                    "cache_creation_input_tokens": total_usage.cache_creation_input_tokens,
+                    "estimated_cost_usd": self._estimate_total_cost(total_usage),
+                },
+            )
 
-                    if think_text:
-                        thinking_started = True
-                        await self._push(stream_ctx, "think", content=think_text)
+            if llm_result["need_retry"]:
+                continue
 
-                    # ③ 处理正式文字
-                    # 内联 <tool_call> 标签可能跨多个 chunk 到来（不完整），
-                    # 不能在 chunk 级过滤，先把原始文字累积到 streamed_text，
-                    # 等 astream 结束后统一解析。
-                    # 非 tool_call 部分实时推送，tool_call 部分暂时不推（下面做截断）。
-                    if isinstance(raw_content, str) and raw_content:
-                        if thinking_started:
-                            thinking_started = False
-                            await self._push(stream_ctx, "think_end")
-                        streamed_text += raw_content
-                        # 把已确定不在 <tool_call> 内的前缀实时推出去
-                        safe = self._safe_prefix_outside_tool_call(raw_content)
-                        if safe:
-                            await self._push(stream_ctx, "text", content=safe)
+            response = llm_result["response"]
+            tool_calls = llm_result["tool_calls"]
+            assistant_text = llm_result["assistant_text"]
 
-                    # ④ 累积 tool_call 增量块（structured tool calling）
-                    chunk_tool_calls = getattr(chunk, "tool_call_chunks", None) or []
-                    for tc_chunk in chunk_tool_calls:
-                        idx = tc_chunk.get("index", 0)
-                        while len(tool_calls_accumulated) <= idx:
-                            tool_calls_accumulated.append(
-                                {"name": "", "args": "", "id": ""}
-                            )
-                        if tc_chunk.get("name"):
-                            tool_calls_accumulated[idx]["name"] += tc_chunk["name"]
-                        if tc_chunk.get("args"):
-                            tool_calls_accumulated[idx]["args"] += tc_chunk["args"]
-                        if tc_chunk.get("id"):
-                            tool_calls_accumulated[idx]["id"] += tc_chunk["id"]
-
-            except Exception as e:
-                err_msg = f"\n[LLM 调用失败：{str(e)}]"
-                await self._push(stream_ctx, "text", content=err_msg)
-                full_response += err_msg
-                break
-
-            # 思考阶段结束信号（若整轮没有正式文字，也要收起思考框）
-            if thinking_started:
-                await self._push(stream_ctx, "think_end")
-
-            # ── Step 4: 检查本轮结果 ──────────────────────────────────
-            # 优先级：① response.tool_calls（structured） → ② tool_call_chunks 累积
-            # → ③ streamed_text 内联解析（Qwen/DeepSeek 内联格式）
-            import json as _json
-            tool_calls = []
             if response is not None:
-                tool_calls = getattr(response, "tool_calls", None) or []
-
-            if not tool_calls and tool_calls_accumulated:
-                for tc in tool_calls_accumulated:
-                    if tc.get("name"):
-                        try:
-                            args = _json.loads(tc["args"]) if tc["args"] else {}
-                        except Exception:
-                            args = {}
-                        tool_calls.append({"name": tc["name"], "args": args, "id": tc["id"]})
-
-            # ③ 内联格式兜底：从 streamed_text 中提取 <tool_call>…</tool_call>
-            inline_tool_calls = []
-            if not tool_calls:
-                inline_tool_calls = self._extract_inline_tool_calls(streamed_text)
-                tool_calls = inline_tool_calls
-
-            # 若确实有内联 tool call，streamed_text 里已经推出了带标签的脏内容，
-            # 需要把纯文字部分（标签之外）重新正确推送（补差）：
-            # 做法是计算 clean_text，与已推出的 streamed_text 做 diff，推送差额。
-            if inline_tool_calls:
-                clean_text = self._strip_inline_tool_calls(streamed_text).strip()
-                # 已推出的内容比 clean_text 多了 tool_call 标签和 tag 周围文字，
-                # 推一个"回退+替换"信号，让前端用 clean_text 覆盖思考区域内的脏内容。
-                # 实现上：推一个 text_replace packet（新类型），前端据此整体替换。
-                if clean_text:
-                    await self._push(stream_ctx, "text_replace", content=clean_text)
-                else:
-                    # 没有纯文字（全是 tool call 描述），清空已推内容
-                    await self._push(stream_ctx, "text_replace", content="")
+                await stm.add_message_async(response)
 
             if not tool_calls:
-                # 纯文字最终回答
-                content = self._strip_inline_tool_calls(streamed_text) or (
-                    response.content if response and isinstance(response.content, str)
-                    else str(response.content) if response else ""
-                )
-                content = content.strip()
+                content = assistant_text.strip()
+                if llm_status == "error":
+                    full_response = content
+                    await self._push(stream_ctx, "control", status="error", full_response=full_response)
+                    break
 
-                # [Harness] deterministic_linter
                 linter = self._get_plugin("deterministic_linter")
                 if linter:
                     ok, reason = linter.validate_output(content, output_type="plain_text")
                     if not ok:
                         await stm.add_message_async(AIMessage(content=content))
-                        await stm.add_message_async(HumanMessage(
-                            content=f"[系统校验：上一条输出不合格，原因：{reason}，请重新生成]"
-                        ))
-                        try:
-                            linter.auto_disable_if_needed(
-                                error_rate=getattr(linter, "_err_count", 0) / max(iteration, 1)
-                            )
-                        except Exception:
-                            pass
+                        await stm.add_message_async(HumanMessage(content=f"[系统校验：上一条输出不合格，原因：{reason}，请重新生成]"))
+                        state.transition = "next_turn"
                         continue
 
                 full_response = content
                 await stm.add_message_async(AIMessage(content=content))
-                break  # ── Step 6: 终止条件满足
+                break
 
-            # ── Step 5: 更新数据 - 执行工具，写回 ShortTermMemory ──────
-            # 先存带 tool_calls 的 AI 消息（保持 OpenAI 对话结构完整性）
-            await stm.add_message_async(response)
+            await self._push(stream_ctx, "loop_status", phase="tool", status="running", message="执行工具调用")
 
             for tool_call in tool_calls:
                 if tool_call_count >= MAX_TOOL_CALLS:
-                    limit_msg = f"\n[系统：工具调用次数超过上限 {MAX_TOOL_CALLS}，已停止]"
-                    await self._push(stream_ctx, "text", content=limit_msg)
-                    full_response += limit_msg
                     force_stop = True
                     break
 
                 tool_call_count += 1
-                tool_name = tool_call.get("name", "") if isinstance(tool_call, dict) else getattr(tool_call, "name", "")
-                tool_args = tool_call.get("args", {}) if isinstance(tool_call, dict) else getattr(tool_call, "args", {})
-                tool_id   = tool_call.get("id", tool_name) if isinstance(tool_call, dict) else getattr(tool_call, "id", tool_name)
+                tool_name = tool_call.get("name", "")
+                tool_args = tool_call.get("args", {})
+                tool_id = tool_call.get("id", tool_name)
 
                 await self._push(
-                    stream_ctx, "tool_call_start",
+                    stream_ctx,
+                    "tool_call_start",
                     tool_name=tool_name,
                     tool_args=tool_args,
+                    tool_call_id=tool_id,
                 )
 
-                # [Harness] isolation_guard.wrap_child_agent
-                # 若被调用的工具本身是一个子 Agent（工具名以 _agent 结尾作为约定），
-                # 则将其 ainvoke 包装为隔离版本：子 Agent 完整输出 → 2-3 句摘要写回父 STM。
-                raw_func = self._tools_map.get(tool_name)
-                if raw_func and tool_name.endswith("_agent") and self._summarizer_llm:
-                    try:
-                        from harness_framework.isolation_guard import wrap_child_agent
+                valid_call, validation_reason, normalized_args = validate_tool_call_against_schema(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    tools_schema=self._tools_schema,
+                    tools_map=self._tools_map,
+                )
 
-                        async def _sync_wrapper(**kw):
-                            return raw_func(**kw)
-
-                        async_func = raw_func if inspect.iscoroutinefunction(raw_func) else _sync_wrapper
-                        isolated_func = wrap_child_agent(
-                            async_func,
-                            result_summarizer_llm=self._summarizer_llm,
-                        )
-                        tool_result = await isolated_func(**tool_args)
-                    except Exception:
-                        tool_result = await self._execute_tool(tool_name, tool_args)
+                if not valid_call:
+                    tool_result = f"[错误] 工具调用参数校验失败：{validation_reason}。请根据工具 schema 重新生成该 function call。"
+                    is_error = True
+                    await self._push(
+                        stream_ctx,
+                        "loop_status",
+                        phase="tool_lint",
+                        status="error",
+                        message=f"{tool_name} 参数校验失败：{validation_reason}",
+                    )
                 else:
-                    tool_result = await self._execute_tool(tool_name, tool_args)
+                    await self._push(
+                        stream_ctx,
+                        "loop_status",
+                        phase="tool_lint",
+                        status="done",
+                        message=f"{tool_name} 参数校验通过",
+                    )
+                    with ToolCallTimer(tool_name):
+                        tool_result = await self._execute_tool(tool_name, normalized_args)
+                    normalized_result, is_error = self._normalize_tool_result(tool_result)
+
+                if not valid_call:
+                    normalized_result = tool_result
 
                 await self._push(
-                    stream_ctx, "tool_call_done",
+                    stream_ctx,
+                    "tool_call_done",
                     tool_name=tool_name,
-                    result_preview=str(tool_result)[:200],
+                    result_preview=str(normalized_result)[:200],
+                    tool_call_id=tool_id,
                 )
 
-                # 写回 ShortTermMemory（第 1 轮写入 10 万字日志也不怕：下一轮 Step 1 会压缩）
-                await stm.add_message_async(ToolMessage(
-                    content=str(tool_result),
-                    tool_call_id=tool_id,
-                    name=tool_name,
-                ))
+                await stm.add_message_async(
+                    ToolMessage(
+                        content=str(normalized_result),
+                        tool_call_id=tool_id,
+                        name=tool_name,
+                    )
+                )
 
-            # ── Step 7: 未触发终止条件，进入下一轮 ──────────────────────
-            # （force_stop 为 True 时，Step 2 会在下一轮入口拦截并 break）
+                await self._push(
+                    stream_ctx,
+                    "observation",
+                    tool_use_id=tool_id,
+                    tool_name=tool_name,
+                    is_error=is_error,
+                    content_preview=str(normalized_result)[:200],
+                )
 
-        # ── 循环结束：长期记忆持久化 ────────────────────────────────────
+            await self._push(stream_ctx, "loop_status", phase="tool", status="done", message="工具执行完成")
+            state.transition = "next_turn"
+
         if user_id and self._memory_manager and full_response:
             try:
                 await self._memory_manager._long_term.summarize_and_save_session(
@@ -433,28 +391,356 @@ class AgentLoop:
 
         return full_response
 
-    # ─────────────────────────────────────────────────────────────
-    # 内部辅助方法
-    # ─────────────────────────────────────────────────────────────
+    async def _try_direct_date_route(self, user_message: HumanMessage, stm, stream_ctx=None) -> Optional[str]:
+        """Answer simple current date/day questions locally so they do not depend on LLM/API availability."""
+
+        user_query = user_message.content if isinstance(user_message.content, str) else ""
+        text = user_query.strip()
+        if not text:
+            return None
+
+        compact = re.sub(r"\s+", "", text)
+        date_intents = (
+            "今天是什么日子",
+            "今天几号",
+            "今天日期",
+            "今天星期几",
+            "现在日期",
+            "当前日期",
+            "今天是哪天",
+        )
+        if not any(intent in compact for intent in date_intents):
+            return None
+
+        now = datetime.now()
+        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        msg = (
+            f"今天是 {now.strftime('%Y年%m月%d日')}，{weekdays[now.weekday()]}。"
+            "如果你想问节日/纪念日/农历等，我可以再帮你查询或计算。"
+        )
+        await self._push_text_streaming(stream_ctx, msg)
+        await stm.add_message_async(AIMessage(content=msg))
+        return msg
+
+    async def _try_direct_weather_skill_route(self, user_message: HumanMessage, stm, stream_ctx=None) -> Optional[str]:
+        """
+        Weather is a canonical package skill and should not be answered by
+        generic web search. For obvious weather queries, deterministically call
+        skill_weather before the LLM has a chance to choose the wrong tool.
+        """
+
+        user_query = user_message.content if isinstance(user_message.content, str) else ""
+        routed_args = detect_weather_tool_args(user_query)
+        if routed_args is None:
+            return None
+        if "skill_weather" not in self._tools_map:
+            return None
+
+        if routed_args.get("__missing_location"):
+            msg = "你想查询哪里的天气？请告诉我城市、地区或机场代码，例如：北京、上海、New York。"
+            await self._push_text_streaming(stream_ctx, msg)
+            await stm.add_message_async(AIMessage(content=msg))
+            return msg
+
+        tool_name = "skill_weather"
+        tool_id = "routed_skill_weather"
+
+        await self._push(
+            stream_ctx,
+            "loop_status",
+            phase="skill_route",
+            status="done",
+            message="检测到天气意图，优先调用内置 Weather Skill",
+        )
+        await self._push(
+            stream_ctx,
+            "tool_call_start",
+            tool_name=tool_name,
+            tool_args=routed_args,
+            tool_call_id=tool_id,
+        )
+
+        valid_call, validation_reason, normalized_args = validate_tool_call_against_schema(
+            tool_name=tool_name,
+            tool_args=routed_args,
+            tools_schema=self._tools_schema,
+            tools_map=self._tools_map,
+        )
+        if not valid_call:
+            result = f"[错误] Weather Skill 参数校验失败：{validation_reason}"
+            is_error = True
+            await self._push(
+                stream_ctx,
+                "loop_status",
+                phase="tool_lint",
+                status="error",
+                message=f"{tool_name} 参数校验失败：{validation_reason}",
+            )
+        else:
+            await self._push(
+                stream_ctx,
+                "loop_status",
+                phase="tool_lint",
+                status="done",
+                message=f"{tool_name} 参数校验通过",
+            )
+            with ToolCallTimer(tool_name):
+                raw_result = await self._execute_tool(tool_name, normalized_args)
+            result, is_error = self._normalize_tool_result(raw_result)
+
+        await self._push(
+            stream_ctx,
+            "tool_call_done",
+            tool_name=tool_name,
+            result_preview=str(result)[:200],
+            tool_call_id=tool_id,
+        )
+        await self._push(
+            stream_ctx,
+            "observation",
+            tool_use_id=tool_id,
+            tool_name=tool_name,
+            is_error=is_error,
+            content_preview=str(result)[:200],
+        )
+
+        await stm.add_message_async(
+            ToolMessage(
+                content=str(result),
+                tool_call_id=tool_id,
+                name=tool_name,
+            )
+        )
+
+        if is_error:
+            final = str(result)
+        else:
+            final = f"查询结果如下：\n\n{result}"
+        await self._push_text_streaming(stream_ctx, final)
+        await stm.add_message_async(AIMessage(content=final))
+        return final
+
+    async def _invoke_llm_streaming(
+        self,
+        state: AgentState,
+        messages_for_llm: List[Any],
+        stream_ctx=None,
+    ) -> Dict[str, Any]:
+        state.turn_count += 1
+
+        usage = UsageStats(
+            input_tokens=sum(count_str_tokens(self._safe_content(m)) for m in messages_for_llm),
+            output_tokens=0,
+        )
+
+        response = None
+        streamed_text = ""
+        tool_calls_accumulated = []
+        thinking_started = False
+        stop_reason = ""
+
+        try:
+            async def _consume_stream():
+                nonlocal response, streamed_text, tool_calls_accumulated, thinking_started, usage
+                async for chunk in self._llm_with_tools.astream(messages_for_llm):
+                    if response is None:
+                        response = chunk
+                    else:
+                        try:
+                            response = response + chunk
+                        except Exception:
+                            response = chunk
+
+                    ak = getattr(chunk, "additional_kwargs", {}) or {}
+                    think_text = ak.get("thinking", "")
+                    raw_content = chunk.content if hasattr(chunk, "content") else ""
+
+                    if isinstance(raw_content, list):
+                        text_parts = []
+                        for block in raw_content:
+                            if isinstance(block, dict) and block.get("type") == "thinking":
+                                think_text += block.get("thinking", "")
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text_parts.append(block.get("text", ""))
+                        raw_content = "".join(text_parts)
+
+                    if think_text:
+                        thinking_started = True
+                        await self._push(stream_ctx, "think", content=think_text)
+
+                    if isinstance(raw_content, str) and raw_content:
+                        if thinking_started:
+                            thinking_started = False
+                            await self._push(stream_ctx, "think_end")
+                        streamed_text += raw_content
+                        safe = self._safe_prefix_outside_tool_call(raw_content)
+                        if safe:
+                            await self._push(stream_ctx, "text", content=safe)
+                            usage.output_tokens += count_str_tokens(safe)
+
+                    chunk_tool_calls = getattr(chunk, "tool_call_chunks", None) or []
+                    for tc_chunk in chunk_tool_calls:
+                        idx = tc_chunk.get("index", 0)
+                        while len(tool_calls_accumulated) <= idx:
+                            tool_calls_accumulated.append({"name": "", "args": "", "id": ""})
+                        if tc_chunk.get("name"):
+                            tool_calls_accumulated[idx]["name"] += tc_chunk["name"]
+                        if tc_chunk.get("args"):
+                            tool_calls_accumulated[idx]["args"] += tc_chunk["args"]
+                        if tc_chunk.get("id"):
+                            tool_calls_accumulated[idx]["id"] += tc_chunk["id"]
+
+            await asyncio.wait_for(_consume_stream(), timeout=90)
+
+            if thinking_started:
+                await self._push(stream_ctx, "think_end")
+
+            tool_calls = []
+            if response is not None:
+                tool_calls = getattr(response, "tool_calls", None) or []
+
+            if not tool_calls and tool_calls_accumulated:
+                for tc in tool_calls_accumulated:
+                    if tc.get("name"):
+                        try:
+                            args = json.loads(tc["args"]) if tc["args"] else {}
+                        except Exception as exc:
+                            args = {
+                                "__raw_args": tc.get("args", ""),
+                                "__parse_error": str(exc),
+                            }
+                        tool_calls.append({"name": tc["name"], "args": args, "id": tc["id"]})
+
+            inline_tool_calls = []
+            if not tool_calls:
+                inline_tool_calls = self._extract_inline_tool_calls(streamed_text)
+                tool_calls = inline_tool_calls
+
+            if inline_tool_calls:
+                clean_text = self._strip_inline_tool_calls(streamed_text).strip()
+                await self._push(stream_ctx, "text_replace", content=clean_text)
+
+            meta = getattr(response, "response_metadata", {}) if response else {}
+            token_usage = meta.get("token_usage", {}) if isinstance(meta, dict) else {}
+            usage.input_tokens = token_usage.get("prompt_tokens", usage.input_tokens)
+            usage.output_tokens = token_usage.get("completion_tokens", usage.output_tokens)
+
+            stop_reason = str(meta.get("finish_reason", "")) if isinstance(meta, dict) else ""
+            if stop_reason == "length":
+                if state.max_output_tokens_override is None:
+                    state.max_output_tokens_override = MAX_OUTPUT_ESCALATED_TOKENS
+                    state.transition = "max_output_tokens_escalate"
+                    return {
+                        "response": None,
+                        "assistant_text": "",
+                        "tool_calls": [],
+                        "usage": usage,
+                        "need_retry": True,
+                        "llm_status": "done",
+                    }
+                state.max_output_tokens_recovery_count += 1
+                if state.max_output_tokens_recovery_count <= MAX_OUTPUT_RECOVERY_LIMIT:
+                    state.transition = "max_output_tokens_recovery"
+                    return {
+                        "response": None,
+                        "assistant_text": "",
+                        "tool_calls": [],
+                        "usage": usage,
+                        "need_retry": True,
+                        "llm_status": "done",
+                    }
+
+            assistant_text = self._strip_inline_tool_calls(streamed_text)
+            return {
+                "response": response,
+                "assistant_text": assistant_text,
+                "tool_calls": tool_calls,
+                "usage": usage,
+                "need_retry": False,
+                "llm_status": "done",
+            }
+
+        except asyncio.TimeoutError:
+            if thinking_started:
+                await self._push(stream_ctx, "think_end")
+            await self._push(stream_ctx, "text", content="\n[LLM 超时：90秒内未返回，已中止本轮并回退]")
+            return {
+                "response": None,
+                "assistant_text": "",
+                "tool_calls": [],
+                "usage": usage,
+                "need_retry": False,
+                "llm_status": "error",
+            }
+
+        except Exception as e:
+            err = str(e)
+            safe_err = self._sanitize_llm_error(err)
+            if "context" in err.lower() and "length" in err.lower() and not state.has_attempted_reactive_compact:
+                if thinking_started:
+                    await self._push(stream_ctx, "think_end")
+                state.has_attempted_reactive_compact = True
+                state.transition = "reactive_compact_retry"
+                return {
+                    "response": None,
+                    "assistant_text": "",
+                    "tool_calls": [],
+                    "usage": usage,
+                    "need_retry": True,
+                }
+
+            if thinking_started:
+                await self._push(stream_ctx, "think_end")
+            error_text = f"\n[LLM 调用失败：{safe_err}]"
+            await self._push(stream_ctx, "text", content=error_text)
+            return {
+                "response": None,
+                "assistant_text": error_text,
+                "tool_calls": [],
+                "usage": usage,
+                "need_retry": False,
+                "llm_status": "error",
+            }
+
+    def _normalize_tool_result(self, tool_result: Any) -> Tuple[str, bool]:
+        if isinstance(tool_result, str):
+            txt = tool_result
+        else:
+            txt = json.dumps(tool_result, ensure_ascii=False) if isinstance(tool_result, (dict, list)) else str(tool_result)
+
+        is_error = txt.startswith("[错误]") or "执行失败" in txt
+        if len(txt) > 50000:
+            txt = txt[:2000] + "\n... [工具输出过大，已截断]"
+        return txt, is_error
+
+    @staticmethod
+    def _safe_content(msg: Any) -> str:
+        content = getattr(msg, "content", "")
+        return content if isinstance(content, str) else str(content)
+
+    @staticmethod
+    def _estimate_total_cost(total_usage: UsageStats) -> float:
+        # 统一估价：仅用于预算守卫，非账单精算
+        input_price = 0.000002
+        output_price = 0.000010
+        cache_read_price = 0.0000002
+        cache_creation_price = 0.0000025
+
+        return (
+            total_usage.input_tokens * input_price
+            + total_usage.output_tokens * output_price
+            + total_usage.cache_read_input_tokens * cache_read_price
+            + total_usage.cache_creation_input_tokens * cache_creation_price
+        )
 
     @staticmethod
     def _read_env_state() -> dict:
-        """
-        环境状态读取：获取当前物理时间（精确到秒）等系统状态，
-        为 StateOrganizer 生成系统提示词提供素材。
-        """
         return {
             "current_time": datetime.now().strftime("%Y年%m月%d日 %H:%M:%S"),
             "weekday": ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.now().weekday()],
         }
 
     async def _retrieve_ltm(self, user_id: str, query: str) -> List[str]:
-        """
-        长期记忆 RAG 检索：
-        基于用户最新消息，通过向量语义召回历史画像、事实偏好。
-        底层走 VectorStore（可扩展为 BGE/Milvus/Neo4j）。
-        无 user_id 或检索失败时安全降级为空列表。
-        """
         if not user_id or not self._memory_manager:
             return []
         try:
@@ -475,7 +761,13 @@ class AgentLoop:
         func = self._tools_map.get(tool_name)
         if func is None:
             return f"[错误] 未找到工具：{tool_name}"
+
         try:
+            if tool_name == "read_file" and isinstance(tool_args, dict):
+                path = tool_args.get("file_path")
+                if path in (None, ""):
+                    return "[错误] read_file 缺少 file_path"
+
             if inspect.iscoroutinefunction(func):
                 result = await func(**tool_args)
             else:
@@ -499,7 +791,6 @@ class AgentLoop:
 
     @staticmethod
     def _get_plugin(name: str):
-        """通过 middleware_plugin_hub 取插件实例，未激活或异常均返回 None。"""
         try:
             from harness_framework.middleware_plugin_hub import get_active_plugin
             return get_active_plugin(name)
@@ -508,11 +799,6 @@ class AgentLoop:
 
     @staticmethod
     def _check_plugin_health() -> bool:
-        """
-        插件健康度熔断检查。
-        当 plugin_hub 本身无法 import（注册表损坏）时返回 False，
-        触发 Step 2 熔断，防止带病推理。正常情况始终返回 True。
-        """
         try:
             from harness_framework.middleware_plugin_hub import list_plugins
             list_plugins()
@@ -521,25 +807,7 @@ class AgentLoop:
             return False
 
     @staticmethod
-    def _filter_inline_tool_call(text: str) -> str:
-        """
-        流式 chunk 级过滤：去掉当前 chunk 中属于 <tool_call>...</tool_call> 的部分。
-        采用状态机逐字符扫描，保留标签外的普通文字。
-        适用于 Qwen / DeepSeek 等把 tool_call 内联在 content 里的模型。
-        """
-        import re
-        # 快速路径：chunk 不含标签特征直接返回
-        if "<tool_call>" not in text and "</tool_call>" not in text:
-            return text
-        # 整体正则替换（chunk 粒度够小，不会跨 chunk 拆分标签）
-        return re.sub(r"<tool_call>[\s\S]*?</tool_call>", "", text)
-
-    @staticmethod
     def _strip_inline_tool_calls(text: str) -> str:
-        """
-        全文兜底过滤：用于最终 content 的完整扫描，
-        去掉所有残留的内联 tool_call 块（含跨 chunk 拼合后的完整标签）。
-        """
         import re
         text = re.sub(r"<tool_call>[\s\S]*?</tool_call>", "", text)
         text = re.sub(r"</?tool_call>", "", text)
@@ -547,23 +815,12 @@ class AgentLoop:
 
     @staticmethod
     def _extract_inline_tool_calls(text: str) -> list:
-        """
-        从内联格式的 content 中提取所有 <tool_call>…</tool_call> 块，
-        返回结构化 tool_calls 列表，格式与 response.tool_calls 一致：
-          [{"name": "web_search", "args": {"query": "..."}, "id": "inline_0"}]
-
-        支持的 JSON key 格式：
-          {"name": "...", "arguments": {...}}   ← Qwen 格式
-          {"name": "...", "parameters": {...}}  ← 部分其他模型
-          {"name": "...", "args": {...}}        ← 标准格式
-        """
         import re
-        import json as _json
         result = []
         for i, m in enumerate(re.finditer(r"<tool_call>([\s\S]*?)</tool_call>", text)):
             raw = m.group(1).strip()
             try:
-                obj = _json.loads(raw)
+                obj = json.loads(raw)
             except Exception:
                 continue
             name = obj.get("name", "")
@@ -575,12 +832,27 @@ class AgentLoop:
 
     @staticmethod
     def _safe_prefix_outside_tool_call(chunk: str) -> str:
-        """
-        从单个 chunk 中取出 <tool_call> 开始标签之前的安全文字部分实时推出。
-        若 chunk 中不含 <tool_call>，直接返回整个 chunk。
-        若 chunk 以 <tool_call> 开头或中间含有，只返回开始标签之前的部分。
-        """
         idx = chunk.find("<tool_call>")
         if idx == -1:
             return chunk
         return chunk[:idx]
+
+    def _sanitize_llm_error(self, err: str) -> str:
+        raw = err or ""
+        lower = raw.lower()
+        if "<!doctype" in lower or "<html" in lower or "websaas" in lower:
+            if "黑名单" in raw or "禁止访问" in raw or "vpn" in lower or "校园网" in raw:
+                model_name = getattr(self, "_model_name", "unknown")
+                return (
+                    f"模型 API 网关返回了 HTML 黑名单/禁止访问页面，当前模型 {model_name} 的接口可能需要 VPN/校园网，"
+                    "或者当前出口 IP 被网关拦截。请检查 .env 里的 LLM_ENDPOINT__/LLM_API_KEY__ 配置，"
+                    "切换到可访问的模型接口，或连接校园网/VPN 后重启服务。"
+                )
+            title = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
+            title_text = re.sub(r"\s+", " ", title.group(1)).strip() if title else "HTML response"
+            return (
+                f"模型 API 返回了非 JSON 的 HTML 页面（{title_text}），说明 LLM endpoint/base_url 可能配置错误或被代理/网关拦截。"
+            )
+        if len(raw) > 800:
+            return raw[:800] + "...[已截断]"
+        return raw
