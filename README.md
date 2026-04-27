@@ -4,8 +4,8 @@
 
 <br/>
 
-**EverLoop is an autonomous agent framework focused on one thing:**
-**keeping the loop stable while the tool surface keeps growing.**
+**A loop-first autonomous agent framework with MCP, Skills,**
+**function-call validation, memory, and streaming runtime observability.**
 
 <br/>
 
@@ -18,364 +18,252 @@
 
 <br/>
 
-**Loop-first · Function-call guarded · Runtime MCP skills · Streaming observable**
+**Agent Loop · MCP Runtime · Skill System · Function Calling · SSE Trace**
 
 </div>
 
 ---
 
-## What is EverLoop?
+## Overview
 
-EverLoop 是一个面向 **自主 Agent Runtime** 的工程化项目。它不是单纯“把 LLM 接上聊天框”，而是围绕一个可持续运行的 Agent loop，去解决这些真正会在复杂场景里出现的问题：
+EverLoop 是一个面向自主 Agent 的工程化运行框架。它围绕一个稳定的 Agent loop 构建，将上下文管理、工具调用、MCP 接入、Skill 编排、长期记忆和前端可观测性整合到同一套运行时中。
 
-- **上下文会不会越跑越脏？**
-- **工具调用参数错了怎么办？**
-- **MCP 工具很多时，主 Agent 怎么保持稳定？**
-- **Skill 怎么真正接入 Agent，而不是只停留在概念层？**
-- **前端怎么把推理、校验、工具调用过程展示清楚？**
+它关注的不是“让模型回复一句话”，而是让 Agent 在多轮推理、工具调用、参数修正和结果整合中持续稳定运行。
 
-这个项目当前重点展示 4 个核心方向：
+### Core Ideas
 
-1. **Loop-first Agent Runtime**：围绕 `AgentLoop.arun()` 的多轮 while 循环。
-2. **Function Calling Guardrails**：`tools_schema + tools_map + linter + retry loop`。
-3. **Runtime MCP Skills**：把 MCP skill 作为主 Agent 的一个工具，而不是把所有 MCP tools 直接灌进全局池。
-4. **Streaming Observability**：通过 SSE 把思考、校验、调用、返回结果实时推到前端。
-
-> Status: actively evolving. The architecture is already demonstrable, while parts of the product surface are still being refined.
+| Area | Description |
+|---|---|
+| Loop-first runtime | 以 `AgentLoop.arun()` 为核心，持续执行推理、校验、工具调用和 observation 写回 |
+| Function-call guardrails | 使用 `tools_schema` 暴露工具接口，使用 `tools_map` 执行真实函数，并通过 linter 校验参数 |
+| MCP as runtime skills | MCP skill 在主 Agent 中表现为一个工具，内部由 MCP 子 Agent 选择具体 MCP tool |
+| Skill packaging | Skill 可以封装说明、文件、脚本、模板和领域工作流 |
+| Streaming trace | 后端通过 SSE 推送思考、工具调用、校验结果、observation 和 token/cost 信息 |
 
 ---
 
-## Feature Showcase
+## Showcase
 
-### Workspace / Chat
+### Workspace
 
-主工作台提供对话区、模型选择、状态面板和整体 Agent 运行入口。
+主工作台提供对话入口、模型选择、状态面板和 Agent 运行视图。
 
 <div align="center">
-  <img src="./img/1.png" alt="Workspace Page" width="100%" />
+  <img src="./img/1.png" alt="EverLoop workspace" width="100%" />
 </div>
 
-### MCP Server Center
+### MCP Center
 
-集中展示 MCP Server、工具列表、工具 Schema，以及 MCP 能力如何接入主 Agent。
+MCP 页面用于管理 MCP Server、查看 tools schema，并将外部工具能力接入 Agent runtime。
 
 <div align="center">
-  <img src="./img/2.png" alt="MCP Page" width="100%" />
+  <img src="./img/2.png" alt="EverLoop MCP center" width="100%" />
 </div>
 
 ### Skill Workbench
 
-展示 Skill 的管理、启停、组织方式，以及 Skill 如何成为 Agent 的能力入口。
+Skill 页面用于管理可见能力包，并将 package skill 或 MCP skill 注册为 Agent 可调用能力。
 
 <div align="center">
-  <img src="./img/3.png" alt="Skills Page" width="100%" />
+  <img src="./img/3.png" alt="EverLoop skill workbench" width="100%" />
 </div>
 
-### Trace / Tool Timeline
+### Runtime Trace
 
-通过可视化调用链展示 SSE 状态流、tool call、observation 和运行过程反馈。
+Trace 页面展示 Agent loop 的实时状态，包括 SSE event、tool call、observation 和调用结果。
 
 <div align="center">
-  <img src="./img/4.png" alt="Trace Page" width="100%" />
+  <img src="./img/4.png" alt="EverLoop runtime trace" width="100%" />
 </div>
 
 ---
 
-## Architecture at a Glance
+## Architecture
 
 ```mermaid
 flowchart TD
     U[User Request] --> API["POST /api/chat/stream"]
-    API --> CA["create_agent_for_request()"]
-    CA --> RT["Load builtin tools + runtime MCP skills + package skills"]
-    RT --> LOOP["AgentLoop.arun()"]
+    API --> AGENT["create_agent_for_request()"]
+    AGENT --> TOOLS["Builtin Tools + Package Skills + Runtime MCP Skills"]
+    TOOLS --> LOOP["AgentLoop.arun()"]
 
-    LOOP --> CP["ContextPipeline.prepare()"]
-    CP --> LTM["LTM retrieval + STM cleanup + compression"]
-    LOOP --> LLM["LLM bind_tools(tools_schema)"]
-    LLM --> FC{"Tool call?"}
+    LOOP --> CTX["ContextPipeline.prepare()"]
+    CTX --> MEM["STM / LTM / Compression / Env State"]
+    MEM --> LLM["LLM with tools_schema"]
+    LLM --> DECIDE{"Tool call?"}
 
-    FC -- No --> RESP["Final answer"]
-    FC -- Yes --> EXEC["_execute_tool() via tools_map"]
-    EXEC --> OBS["ToolMessage / observation"]
+    DECIDE -- No --> ANSWER["Final Answer"]
+    DECIDE -- Yes --> LINT["Function-call Linter"]
+    LINT -->|valid| EXEC["Execute via tools_map"]
+    LINT -->|invalid| RETRY["Validation feedback"]
+    EXEC --> OBS["ToolMessage / Observation"]
+    RETRY --> LOOP
     OBS --> LOOP
 
-    LOOP --> SSE["Typed SSE packets"]
-    SSE --> FE["React frontend"]
+    LOOP --> SSE["Typed SSE Stream"]
+    SSE --> UI["React Frontend"]
 ```
 
 ---
 
-## The Core Loop
+## Agent Loop
 
-EverLoop 的核心不是“有多少工具”，而是 **工具越来越多时，loop 还能不能稳定跑下去**。
-
-`AgentLoop.arun()` 大致承担这些职责：
-
-1. 准备上下文：STM / LTM / 环境信息 / 压缩后的消息
-2. 让模型在 `tools_schema` 可见的前提下进行推理
-3. 拿到 function call 后先做 **schema + 参数校验**
-4. 成功则执行工具，失败则把错误回写到下一轮循环
-5. 通过 observation / ToolMessage 把结果继续喂回 Agent
-6. 直到得到最终回答或命中终止条件
-
-这也是为什么 README 里后面重点展开的是：
-
-- Skill 怎么接到这个 loop
-- MCP 怎么接到这个 loop
-- Function call 怎么在这个 loop 里被兜住
-
----
-
-## Skill: from concept to runtime
-
-### 1) Skill 的本质
-
-Skill 接到 agent 里，本质上是把一组 **说明、文件、脚本、模板** 暴露给 agent，让 agent 在合适的时候自动加载并遵循。
+EverLoop 的核心是一个持续运行的 Agent loop。每一轮都会经历上下文准备、模型推理、结果校验、工具执行和状态写回。
 
 ```mermaid
 flowchart TD
-    A[User Request] --> B["Agent matches skill description"]
-    B --> C["Read SKILL.md"]
-    C --> D["Decide whether to read references / assets / scripts"]
-    D --> E["Run local shell / Python / Node tools when needed"]
-    E --> F["Integrate result into final answer or code changes"]
+    A["Load STM / LTM / env state"] --> B["Compress and organize context"]
+    B --> C["LLM inference with tools_schema"]
+    C --> D{"Tool calls generated?"}
+    D -- No --> E["Return final response"]
+    D -- Yes --> F["Validate tool call arguments"]
+    F --> G{"Valid?"}
+    G -- No --> H["Write validation error into next loop"]
+    G -- Yes --> I["Execute tool through tools_map"]
+    I --> J["Write observation back to loop"]
+    H --> B
+    J --> B
 ```
 
-### 2) 这个项目里 Skill 的展示重点
+### Why the loop matters
 
-在 EverLoop 里，你可以把 Skill 理解成两种形态：
-
-- **Package Skill**：本地打包能力，带 `SKILL.md`、文件、模板、脚本。
-- **Runtime MCP Skill**：对主 Agent 来说，它表现为一个 `StructuredTool`；但内部会再启一个 MCP 子 Agent 去选具体 MCP tool。
-
-这也是这个项目最适合展示的点之一：  
-**“Skill 并不是一个静态提示词文件，而是 Agent 可调用的能力入口。”**
+As the tool surface grows, the main risk is not simply whether a model can call a tool once. The harder problem is keeping context, tool selection, validation, execution, and recovery predictable across many turns. EverLoop keeps these steps explicit inside the loop.
 
 ---
 
-## How runtime MCP skills are wired into the main agent
+## Function Calling
 
-下面这个流程基本就是你现在代码里的真实路径：
+EverLoop separates tool exposure from tool execution:
 
-```mermaid
-flowchart TD
-    A[User Request] --> B["/api/chat/stream"]
-    B --> C["create_agent_for_request()"]
-    C --> D["build_runtime_mcp_skill_tools()"]
-    D --> E["Each visible MCP skill becomes a StructuredTool: skill_xxx"]
-    E --> F["Main Agent LLM decides whether to call skill_xxx"]
-    F --> G["AgentLoop._execute_tool()"]
-    G --> H["runtime_mcp_skills._invoke_skill()"]
-    H --> I["MCPAgent.ainvoke()"]
-    I --> J["pipeline_manager.arun_pipeline()"]
-    J --> K["MCP child agent selects a concrete MCP tool"]
-    K --> L["mcp_client.call_tool()"]
-    L --> M["Result goes back to main agent as observation"]
-```
-
-### Why this matters
-
-这个设计和很多“把 MCP tools 直接合并进全局工具池”的方案不一样：
-
-- **主 Agent 看到的是 skill 粒度**
-- **子 Agent 看到的是具体 MCP tool 粒度**
-- 这样可以把主 Agent 的工具面控制得更稳，更容易解释，也更适合展示“能力编排”
-
----
-
-## Function Calling: how EverLoop does it
-
-你这套 function call 设计，其实非常适合单独拿出来展示，因为它不只是“让 LLM 会调工具”，而是补了 **工程上的可靠性闭环**。
-
-### `tools_schema` vs `tools_map`
-
-在 `create_react_agent()` 里，工具会被拆成两个字段：
-
-| Field | Role |
+| Component | Role |
 |---|---|
-| `tools_schema` | 传给 LLM，让模型知道有哪些工具、每个工具叫什么、参数怎么传 |
-| `tools_map` | 真正执行时的运行时映射：工具名 -> Python 函数 / coroutine |
+| `tools_schema` | Sent to the LLM. It describes available tools, names, descriptions, and parameter schemas |
+| `tools_map` | Used by the runtime. It maps a selected tool name to the actual Python function or coroutine |
+| `fc_validator.py` | Validates function calls before execution |
 
-所以可以很直白地理解为：
+Before any tool is executed, EverLoop validates:
 
-- `tools_schema` 解决 **“模型看见什么”**
-- `tools_map` 解决 **“运行时到底调什么”**
+- whether the tool exists
+- whether arguments are a JSON object
+- whether required parameters are present
+- whether argument types match the schema
+- whether unexpected parameters are allowed
+- whether suspicious injection-like content appears
 
-### Linter validation
-
-EverLoop 在执行 function call 前，会先走本地校验：
-
-- 工具名是否存在
-- 参数是否是 JSON object
-- 必填参数是否缺失
-- 参数类型是否匹配 schema
-- 是否有额外非法参数
-- 是否有可疑注入内容
-
-这部分由 `function_calling/fc_validator.py` 负责，是一个 **机械校验层**，不是语义猜测层。
-
-### Feedback loop
-
-真正有价值的是：**校验失败不会直接把流程打死，而是会回到下一轮 loop。**
+If validation fails, the error is written back into the Agent loop. The model can then repair the call in the next iteration instead of failing silently.
 
 ```mermaid
 flowchart TD
-    A["LLM outputs function call"] --> B["Validate against tools_schema"]
-    B -->|pass| C["Execute tool via tools_map"]
-    B -->|fail| D["Return tool_lint error / validation reason"]
-    C --> E["Observation / ToolMessage"]
+    A["LLM outputs tool call"] --> B["Validate against tools_schema"]
+    B -->|Pass| C["Execute function from tools_map"]
+    B -->|Fail| D["Return tool_lint feedback"]
+    C --> E["Observation"]
     D --> F["Next loop iteration"]
     E --> F
-    F --> G["LLM replans -> calls tool again or answers"]
 ```
-
-这意味着：
-
-- 生成对了：进入下一轮继续推进任务
-- 生成错了：也进入下一轮，但带着错误原因继续修正
-
-前端也能把这件事展示出来，比如你提到的：
-
-- `tool_lint error`
-- 失败原因
-- 下一轮重新规划 / 重新调用
-
-这个展示效果会非常加分，因为别人能直观看到：
-**你的 Agent 不是“碰到工具错误就停”，而是具备自修复闭环。**
 
 ---
 
-## MCP in EverLoop
+## Skill System
 
-### The core design choice
-
-EverLoop 里的 MCP 不是简单地把服务端 tools 全量暴露给主 Agent，而是采用：
-
-> **MCP skill 作为主 Agent 的一个工具**  
-> **MCP 子 Agent 再去选择具体 MCP tool**
-
-这就是你这套设计最值得强调的差异点。
+A Skill is a packaged capability that can expose instructions, files, scripts, templates, and workflow-specific context to an Agent.
 
 ```mermaid
 flowchart TD
-    A[User Request] --> B["Main agent loads visible MCP skills"]
-    B --> C["Register MCP skill as a main-agent tool: skill_xxx"]
-    C --> D["Main agent decides whether to call skill_xxx"]
-    D --> E["runtime_mcp_skills._invoke_skill()"]
-    E --> F["MCPAgent.ainvoke()"]
-    F --> G["parse_server_tools_schema()"]
-    G --> H["Bind MCP tools to child LLM"]
-    H --> I["Function-call linter validates arguments"]
-    I --> J["mcp_client.call_tool()"]
-    J --> K["JSON-RPC MCP: initialize -> notifications/initialized -> tools/call"]
-    K --> L["Fallback REST if needed: GET /tools/list, POST /tools/call"]
-    L --> M["Return result as ToolMessage / observation"]
+    A[User Request] --> B["Match skill description"]
+    B --> C["Read SKILL.md"]
+    C --> D["Load references / assets / scripts if needed"]
+    D --> E["Run local tools when required"]
+    E --> F["Return result to the Agent loop"]
 ```
 
-### MCP protocol behavior in this repo
+EverLoop supports two main skill styles:
 
-在 EverLoop 里，主 Agent 或 MCP 子 Agent 扮演的是 **MCP Client**，远端能力提供方扮演 **MCP Server**。
-
-运行过程大致是：
-
-1. 连接 MCP Server
-2. 获取工具列表（`tools/list`）
-3. 转换为 LLM 可理解的 tool schema
-4. 由模型选择工具并生成参数
-5. 本地 linter 先做机械校验
-6. 校验通过后再发起 `tools/call`
-7. 结果标准化成 `observation / ToolMessage`
-8. 写回 Agent loop，进入下一轮推理
-
-### Transport compatibility
-
-这个仓库做了两层兼容：
-
-- **优先标准 JSON-RPC MCP**
-  - `initialize`
-  - `notifications/initialized`
-  - `tools/list`
-  - `tools/call`
-
-- **不支持标准 MCP 时回退旧 REST**
-  - `GET /tools/list`
-  - `POST /tools/call`
-
-这点很适合写进 README，因为它体现的是：
-**你不只是“能接 MCP”，而是在做一个更稳的 MCP client adapter。**
+| Skill Type | Description |
+|---|---|
+| Package Skill | A local capability package with files, templates, scripts, and `SKILL.md` |
+| Runtime MCP Skill | A skill backed by an MCP Server, registered as a main-agent tool |
 
 ---
 
-## Streaming observability
+## MCP Runtime
 
-前端展示不是附属品，而是这套系统的一部分。  
-EverLoop 用 SSE 把 Agent loop 的关键阶段持续推给前端。
+EverLoop treats MCP as a client-server protocol for external tools. The Agent or MCP child Agent acts as the MCP Client; the external capability provider acts as the MCP Server.
 
-### Packet types
+The design is intentionally layered:
+
+```mermaid
+flowchart TD
+    A[User Request] --> B["Main Agent"]
+    B --> C["Calls MCP Skill, e.g. skill_xxx"]
+    C --> D["runtime_mcp_skills._invoke_skill()"]
+    D --> E["MCPAgent.ainvoke()"]
+    E --> F["parse_server_tools_schema()"]
+    F --> G["Child LLM chooses concrete MCP tool"]
+    G --> H["Validate tool args"]
+    H --> I["mcp_client.call_tool()"]
+    I --> J["Return observation to main Agent"]
+```
+
+This keeps the main Agent's tool surface smaller. The main Agent chooses the skill-level capability, while the MCP child Agent chooses the concrete server-side tool.
+
+### MCP Transport
+
+EverLoop first tries standard JSON-RPC MCP:
+
+- `initialize`
+- `notifications/initialized`
+- `tools/list`
+- `tools/call`
+
+For compatibility with older servers, it can fall back to REST-style endpoints:
+
+- `GET /tools/list`
+- `POST /tools/call`
+
+---
+
+## Streaming Observability
+
+EverLoop streams typed SSE packets to the frontend so the runtime can be inspected while it is running.
 
 | Packet Type | Meaning |
 |---|---|
-| `think` | 流式思考文本 |
-| `think_end` | 思考阶段结束 |
-| `text` | 正式回答文本流 |
-| `text_replace` | 用清洗后的文本替换当前回答 |
-| `loop_status` | 当前 loop 阶段状态 |
-| `tool_call_start` | 开始调用某个工具 |
-| `tool_call_done` | 工具调用完成 |
-| `observation` | 工具返回结果摘要 |
-| `usage_update` | token / cost 更新 |
-| `control` | 整个流的结束、错误、终止状态 |
-
-### What the frontend can show
-
-- Agent 当前处于哪一个阶段
-- 是否在思考、是否在调用工具
-- 调了哪个工具、参数是什么、结果摘要是什么
-- MCP 调用是否成功
-- 参数校验是否失败
-- 当前 token / cost 统计
-
-这会让你的 GitHub 展示不只是“有个聊天界面”，而是能体现：
-**这是一个有运行时透明度的 Agent 平台。**
+| `think` | Streams model thinking content into the UI |
+| `think_end` | Marks the end of a thinking block |
+| `text` | Streams final answer text |
+| `text_replace` | Replaces already-streamed text after cleanup |
+| `loop_status` | Reports the current runtime phase |
+| `tool_call_start` | Reports that a tool call has started |
+| `tool_call_done` | Reports tool completion and result preview |
+| `observation` | Sends the normalized tool observation |
+| `usage_update` | Reports token and estimated cost usage |
+| `control` | Reports stream completion, abort, or error |
 
 ---
 
-## Project structure
+## Project Structure
 
 ```text
 EverLoop/
-├── api/                    # FastAPI routes: chat / auth / mcp / skill
+├── api/                    # FastAPI routes: chat, auth, MCP, skill
 ├── core/                   # Agent loop, context pipeline, streaming handler
-├── memory/                 # STM / LTM / memory manager
-├── function_calling/       # tool registry + schema validator
-├── harness_framework/      # loop plugins / guards / linter / janitor
-├── mcp_ecosystem/          # MCP client, server manager, pipeline, child agent
-├── skill_system/           # package skills + runtime MCP skills
-├── llm/                    # model factory / config
-├── database/               # persistence models / CRUD / vector layer
+├── database/               # SQLAlchemy models, CRUD, persistence
+├── function_calling/       # Tool registry and function-call validation
+├── harness_framework/      # Runtime plugins, guards, cleanup daemons
+├── init/                   # Agent assembly and runtime initialization
+├── llm/                    # Model factory and provider configuration
+├── mcp_ecosystem/          # MCP client, server manager, child Agent pipeline
+├── memory/                 # Short-term and long-term memory layers
+├── skill_system/           # Package skills and runtime MCP skills
 ├── frontend/               # React + TypeScript UI
-├── init/                   # main agent assembly
-└── main.py                 # app entry
+├── scripts/                # Startup and health-check helpers
+└── main.py                 # FastAPI application entrypoint
 ```
 
 ---
 
-## What this repo is especially good at demonstrating
-
-如果你准备把它作为 GitHub 展示项目，我建议你把亮点聚焦在这 5 个关键词上：
-
-1. **Agent Loop Runtime**
-2. **Function Call Reliability**
-3. **Runtime MCP Skill Orchestration**
-4. **Context + Memory Management**
-5. **Streaming Debuggability**
-
-因为这 5 个词能把你的代码从“一个 AI demo”提升成“一个有 runtime design 的 agent system”。
-
----
-
-## Quick start
+## Quick Start
 
 ### Backend
 
@@ -384,7 +272,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Backend runs on:
+Backend runs at:
 
 ```text
 http://127.0.0.1:8001
@@ -398,7 +286,7 @@ npm install
 npm run dev
 ```
 
-Frontend runs on:
+Frontend runs at:
 
 ```text
 http://localhost:5173
@@ -406,7 +294,7 @@ http://localhost:5173
 
 ### Environment
 
-Before running the project, make sure your root `.env` contains at least the LLM connection settings your runtime needs, for example:
+Configure the LLM endpoint and runtime settings in `.env`:
 
 ```env
 LLM_API_KEY=your_key
@@ -418,12 +306,24 @@ DATABASE_URL=sqlite+aiosqlite:///./everloop.db
 
 ---
 
-## License
+## Tech Stack
 
-MIT License — see [LICENSE](LICENSE) for details.
+| Layer | Stack |
+|---|---|
+| Backend | Python, FastAPI, LangChain, SQLAlchemy |
+| Frontend | React, TypeScript, Vite, Zustand |
+| Agent Runtime | Custom AgentLoop, function-call validator, MCP child Agent |
+| Memory | STM, LTM, vector-store-ready retrieval |
+| Streaming | Server-Sent Events with typed packets |
 
 ---
 
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
+
+<br/>
+
 <div align="center">
-  <sub>If EverLoop helps you communicate agent runtime ideas more clearly, a ⭐ would mean a lot.</sub>
+  <sub>Built for agent systems that need to keep thinking, calling tools, and recovering in the same loop.</sub>
 </div>
