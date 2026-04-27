@@ -58,50 +58,37 @@ EverLoop 是一个面向 **自主 Agent Runtime** 的工程化项目。它不是
 
 ## UI Showcase
 
-> 当前我先帮你把 README 的展位和命名规范搭好。  
-> `docs/screenshots/` 里放了占位图，你后续只需要把它们替换成真实截图即可。
+以下是当前已经完成的核心页面展示：
 
 <table>
   <tr>
-    <td width="50%" valign="top">
-      <strong>Login / Register</strong><br/>
-      <img src="./docs/screenshots/login-page.svg" alt="Login Page" />
-    </td>
-    <td width="50%" valign="top">
+    <td width="50%" valign="top" align="center">
       <strong>Workspace / Chat</strong><br/>
-      <img src="./docs/screenshots/workspace-page.svg" alt="Workspace Page" />
+      <img src="./img/1.png" alt="Workspace Page" />
     </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <strong>Agents / Status View</strong><br/>
-      <img src="./docs/screenshots/agents-page.svg" alt="Agents Page" />
-    </td>
-    <td width="50%" valign="top">
+    <td width="50%" valign="top" align="center">
       <strong>MCP Server Center</strong><br/>
-      <img src="./docs/screenshots/mcp-page.svg" alt="MCP Page" />
+      <img src="./img/2.png" alt="MCP Page" />
     </td>
   </tr>
   <tr>
-    <td width="50%" valign="top">
+    <td width="50%" valign="top" align="center">
       <strong>Skill Workbench</strong><br/>
-      <img src="./docs/screenshots/skills-page.svg" alt="Skills Page" />
+      <img src="./img/3.png" alt="Skills Page" />
     </td>
-    <td width="50%" valign="top">
+    <td width="50%" valign="top" align="center">
       <strong>Trace / Tool Timeline</strong><br/>
-      <img src="./docs/screenshots/trace-page.svg" alt="Trace Page" />
+      <img src="./img/4.png" alt="Trace Page" />
     </td>
   </tr>
 </table>
 
 ### Recommended screenshot checklist
 
-- `login-page.*`：登录 / 注册页
-- `workspace-page.*`：主对话区 + 输入框 + 输出区
-- `agents-page.*`：左侧视图切换、状态面板、模型选择
-- `mcp-page.*`：MCP server 列表、tools schema、工具调用区
-- `skills-page.*`：skill 列表、开关、同步 / 创建 skill
-- `trace-page.*`：SSE 状态流、tool cards、observation、usage
+- `img/1.png`：工作台 / 主对话区
+- `img/2.png`：MCP Server 管理与工具展示
+- `img/3.png`：Skill 管理与工作区
+- `img/4.png`：Trace / Tool Timeline / SSE 状态流
 
 ---
 
